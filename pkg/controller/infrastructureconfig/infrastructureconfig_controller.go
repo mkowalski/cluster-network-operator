@@ -3,15 +3,14 @@ package infrastructureconfig
 import (
 	"context"
 	"fmt"
-	"log"
-	"reflect"
-
 	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/cluster-network-operator/pkg/apply"
 	cnoclient "github.com/openshift/cluster-network-operator/pkg/client"
 	"github.com/openshift/cluster-network-operator/pkg/controller/statusmanager"
 	"github.com/openshift/cluster-network-operator/pkg/names"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"log"
+	"reflect"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -112,31 +111,42 @@ func (r *ReconcileInfrastructureConfig) Reconcile(ctx context.Context, request r
 		return reconcile.Result{}, err
 	}
 
-	// The "duplicated" logic below is a direct result of how server-side-apply works for this
-	// object. Where it would be natural that `apply.ApplyObject` updates both Spec and Status
-	// at the same time, in reality the first call only updates Spec and leaves Status with the
-	// old content. To fix that and have Status also updated, we are executing a second call with
-	// explicit marker that "status" subresource should be updated.
-	if !reflect.DeepEqual(updatedInfraConfig.Spec, infraConfig.Spec) {
-		if err = r.updateInfrastructureConfig(ctx, updatedInfraConfig); err != nil {
-			err = fmt.Errorf("Error while updating infrastructures.%s/cluster: %w", configv1.GroupName, err)
+	//// The "duplicated" logic below is a direct result of how server-side-apply works for this
+	//// object. Where it would be natural that `apply.ApplyObject` updates both Spec and Status
+	//// at the same time, in reality the first call only updates Spec and leaves Status with the
+	//// old content. To fix that and have Status also updated, we are executing a second call with
+	//// explicit marker that "status" subresource should be updated.
+	//if !reflect.DeepEqual(updatedInfraConfig.Spec, infraConfig.Spec) {
+	//	if err = r.updateInfrastructureConfig(ctx, updatedInfraConfig); err != nil {
+	//		err = fmt.Errorf("Error while updating infrastructures.%s/cluster: %w", configv1.GroupName, err)
+	//		log.Println(err)
+	//
+	//		r.status.SetDegraded(statusmanager.InfrastructureConfig, "UpdateInfrastructureSpecOrStatus", err.Error())
+	//		return reconcile.Result{}, err
+	//	}
+	//	log.Printf("Successfully synchronized infrastructure config.")
+	//}
+	//
+	//if !reflect.DeepEqual(updatedInfraConfig.Status, infraConfig.Status) {
+	//	if err = r.updateInfrastructureConfig(ctx, updatedInfraConfig, "status"); err != nil {
+	//		err = fmt.Errorf("Error while updating status of infrastructures.%s/cluster: %w", configv1.GroupName, err)
+	//		log.Println(err)
+	//
+	//		r.status.SetDegraded(statusmanager.InfrastructureConfig, "UpdateInfrastructureStatus", err.Error())
+	//		return reconcile.Result{}, err
+	//	}
+	//	log.Printf("Successfully synchronized infrastructure config status")
+	//}
+
+	if !reflect.DeepEqual(updatedInfraConfig.Spec, infraConfig.Spec) || !reflect.DeepEqual(updatedInfraConfig.Status, infraConfig.Status) {
+		if err = r.client.Default().CRClient().Update(ctx, updatedInfraConfig); err != nil {
+			err = fmt.Errorf("Error while client-side updating infrastructures.%s/cluster: %w", configv1.GroupName, err)
 			log.Println(err)
 
 			r.status.SetDegraded(statusmanager.InfrastructureConfig, "UpdateInfrastructureSpecOrStatus", err.Error())
 			return reconcile.Result{}, err
 		}
 		log.Printf("Successfully synchronized infrastructure config.")
-	}
-
-	if !reflect.DeepEqual(updatedInfraConfig.Status, infraConfig.Status) {
-		if err = r.updateInfrastructureConfig(ctx, updatedInfraConfig, "status"); err != nil {
-			err = fmt.Errorf("Error while updating status of infrastructures.%s/cluster: %w", configv1.GroupName, err)
-			log.Println(err)
-
-			r.status.SetDegraded(statusmanager.InfrastructureConfig, "UpdateInfrastructureStatus", err.Error())
-			return reconcile.Result{}, err
-		}
-		log.Printf("Successfully synchronized infrastructure config status")
 	}
 
 	r.status.SetNotDegraded(statusmanager.InfrastructureConfig)
