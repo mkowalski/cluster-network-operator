@@ -294,6 +294,13 @@ spec:
           requests:
             cpu: 10m
             memory: 20Mi
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: network.openshift.io/frr-k8s-static-pod
+                operator: DoesNotExist
       nodeSelector:
         kubernetes.io/os: linux
       tolerations:
