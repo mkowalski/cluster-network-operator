@@ -34,6 +34,7 @@ controllerconfigs.machineconfiguration.openshift.io:
   - AWSEuropeanSovereignCloudInstall
   - AzureClusterHostedDNSInstall
   - AzureDualStackInstall
+  - BGPBasedVIPManagement
   - DualReplica
   - DyanmicServiceEndpointIBMCloud
   - NutanixMultiSubnets

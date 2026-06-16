@@ -1059,6 +1059,16 @@ type BareMetalPlatformStatus struct {
 	// +optional
 	LoadBalancer *BareMetalPlatformLoadBalancer `json:"loadBalancer,omitempty"`
 
+	// vipManagement indicates which VIP management mechanism is active
+	// on this cluster. When set to "BGP", kube-vip (Routing Table Mode)
+	// and frr-k8s are deployed as static pods to advertise VIPs via BGP,
+	// replacing the default keepalived/VRRP mechanism. When empty or
+	// "Keepalived", the default keepalived-based VIP management is used.
+	// +openshift:enable:FeatureGate=BGPBasedVIPManagement
+	// +kubebuilder:validation:Enum="";"Keepalived";"BGP"
+	// +optional
+	VIPManagement string `json:"vipManagement,omitempty"`
+
 	// dnsRecordsType determines whether records for api, api-int, and ingress
 	// are provided by the internal DNS service or externally.
 	// Allowed values are `Internal`, `External`, and omitted.
