@@ -1,10 +1,9 @@
 # RBAC for the frr-k8s static pod on control plane nodes (BGP VIP management).
 # The static pod has no ServiceAccount; its controller and frr-status
-# containers authenticate with the node kubeconfig, so grant the nodes group
-# read access to FRRConfigurations and write access to node state CRs.
-# NOTE: the exact subject is verified on a live cluster during the demo
-# (oc --kubeconfig=/etc/kubernetes/kubeconfig auth whoami); adjust if the
-# identity is not in system:nodes.
+# containers authenticate with the node kubeconfig
+# (/etc/kubernetes/kubeconfig), whose identity is the MCO node-bootstrapper
+# ServiceAccount (verified live via oc auth whoami). Grant it read access to
+# FRRConfigurations/FRRK8sConfigurations and write access to node state CRs.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -14,6 +13,7 @@ rules:
   - frrk8s.metallb.io
   resources:
   - frrconfigurations
+  - frrk8sconfigurations
   verbs:
   - get
   - list
@@ -58,6 +58,6 @@ roleRef:
   kind: ClusterRole
   name: frr-k8s-static-pod
 subjects:
-- apiGroup: rbac.authorization.k8s.io
-  kind: Group
-  name: system:nodes
+- kind: ServiceAccount
+  name: node-bootstrapper
+  namespace: openshift-machine-config-operator
