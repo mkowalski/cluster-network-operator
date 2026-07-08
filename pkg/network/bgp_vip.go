@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"slices"
 
 	configv1 "github.com/openshift/api/config/v1"
 	apifeatures "github.com/openshift/api/features"
@@ -20,12 +21,14 @@ import (
 )
 
 // bgpVIPPeer represents a BGP peer configuration from the bgp-vip-config ConfigMap.
+// String-typed BFDEnabled and EBGPMultiHop ("true"/"false") match the
+// installer's BGPPeerConfig serialization.
 type bgpVIPPeer struct {
 	PeerAddress   string `json:"peerAddress"`
 	PeerASN       int64  `json:"peerASN"`
 	Password      string `json:"password,omitempty"`
 	BFDEnabled    string `json:"bfdEnabled,omitempty"`
-	EBGPMultiHop  bool   `json:"ebgpMultiHop,omitempty"`
+	EBGPMultiHop  string `json:"ebgpMultiHop,omitempty"`
 	HoldTime      string `json:"holdTime,omitempty"`
 	KeepaliveTime string `json:"keepaliveTime,omitempty"`
 }
@@ -55,7 +58,10 @@ func renderBGPVIPFRRConfiguration(client cnoclient.Client, bootstrapResult *boot
 		return nil, nil
 	}
 
-	if !featureGates.Enabled(apifeatures.FeatureGateBGPBasedVIPManagement) {
+	// Enabled panics on gates unknown to the cluster's FeatureGate status,
+	// so guard the lookup (same idiom as the NoOverlayMode gate).
+	if !slices.Contains(featureGates.KnownFeatures(), apifeatures.FeatureGateBGPBasedVIPManagement) ||
+		!featureGates.Enabled(apifeatures.FeatureGateBGPBasedVIPManagement) {
 		return nil, nil
 	}
 	if bootstrapResult.Infra.PlatformStatus.BareMetal.VIPManagement != "BGP" {
@@ -121,7 +127,7 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 		if peer.BFDEnabled == "true" {
 			neighbor["bfdProfile"] = "vip-bfd"
 		}
-		if peer.EBGPMultiHop {
+		if peer.EBGPMultiHop == "true" {
 			neighbor["ebgpMultiHop"] = true
 		}
 		neighbors = append(neighbors, neighbor)
@@ -133,8 +139,8 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 		if peer.BFDEnabled == "true" {
 			bfdProfiles = append(bfdProfiles, map[string]interface{}{
 				"name":             "vip-bfd",
-				"receiveInterval":  300,
-				"transmitInterval": 300,
+				"receiveInterval":  int64(300),
+				"transmitInterval": int64(300),
 			})
 			break
 		}
