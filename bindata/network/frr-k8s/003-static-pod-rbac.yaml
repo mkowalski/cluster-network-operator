@@ -1,0 +1,63 @@
+# RBAC for the frr-k8s static pod on control plane nodes (BGP VIP management).
+# The static pod has no ServiceAccount; its controller and frr-status
+# containers authenticate with the node kubeconfig, so grant the nodes group
+# read access to FRRConfigurations and write access to node state CRs.
+# NOTE: the exact subject is verified on a live cluster during the demo
+# (oc --kubeconfig=/etc/kubernetes/kubeconfig auth whoami); adjust if the
+# identity is not in system:nodes.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: frr-k8s-static-pod
+rules:
+- apiGroups:
+  - frrk8s.metallb.io
+  resources:
+  - frrconfigurations
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - frrk8s.metallb.io
+  resources:
+  - frrnodestates
+  - bgpsessionstates
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - update
+  - patch
+  - delete
+- apiGroups:
+  - frrk8s.metallb.io
+  resources:
+  - frrnodestates/status
+  - bgpsessionstates/status
+  verbs:
+  - get
+  - update
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: frr-k8s-static-pod
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: frr-k8s-static-pod
+subjects:
+- apiGroup: rbac.authorization.k8s.io
+  kind: Group
+  name: system:nodes
