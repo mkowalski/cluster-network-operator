@@ -28,13 +28,34 @@ func TestBuildFRRConfigurationObjects(t *testing.T) {
 	g.Expect(found).To(BeTrue())
 	g.Expect(neighbors).To(HaveLen(1))
 
-	// The VIP prefixes must be declared at router level as well: the frr-k8s
-	// validation webhook rejects advertising prefixes not configured on the
-	// router.
-	routerPrefixes, found, err := uns.NestedStringSlice(routers[0].(map[string]interface{}), "prefixes")
+	// VIP advertisement must NOT use CRD prefixes: frr-k8s renders those as
+	// unconditional `network` statements, which bypass the kube-vip health
+	// gate (routing table 198). No router-level prefixes, no toAdvertise.
+	_, found, err = uns.NestedStringSlice(routers[0].(map[string]interface{}), "prefixes")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeFalse())
+	neighbor := neighbors[0].(map[string]interface{})
+	g.Expect(neighbor).NotTo(HaveKey("toAdvertise"))
+	g.Expect(neighbor["address"]).To(Equal("192.168.111.1"))
+	g.Expect(neighbor["asn"]).To(Equal(int64(64513)))
+
+	// Advertisement happens exclusively via health-gated redistribution of
+	// routing table 198, filtered to exactly the VIP prefixes.
+	rawConfig, found, err := uns.NestedString(objs[0].Object, "spec", "raw", "rawConfig")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeTrue())
-	g.Expect(routerPrefixes).To(ConsistOf("192.168.111.5/32", "192.168.111.4/32"))
+	g.Expect(rawConfig).To(ContainSubstring("router bgp 64512"))
+	g.Expect(rawConfig).To(ContainSubstring("redistribute table-direct 198 route-map BGP-VIP-ROUTES-V4"))
+	g.Expect(rawConfig).To(ContainSubstring("route-map BGP-VIP-ROUTES-V4 permit 10"))
+	g.Expect(rawConfig).To(ContainSubstring("match ip address prefix-list BGP-VIP-PREFIXES-V4"))
+	g.Expect(rawConfig).To(ContainSubstring("route-map BGP-VIP-ROUTES-V4 deny 20"))
+	g.Expect(rawConfig).To(ContainSubstring("ip prefix-list BGP-VIP-PREFIXES-V4 seq 10 permit 192.168.111.5/32"))
+	g.Expect(rawConfig).To(ContainSubstring("ip prefix-list BGP-VIP-PREFIXES-V4 seq 20 permit 192.168.111.4/32"))
+	// No IPv6 VIPs: the v6 address-family, route-map, and prefix-list blocks
+	// must be omitted entirely.
+	g.Expect(rawConfig).NotTo(ContainSubstring("address-family ipv6"))
+	g.Expect(rawConfig).NotTo(ContainSubstring("BGP-VIP-ROUTES-V6"))
+	g.Expect(rawConfig).NotTo(ContainSubstring("BGP-VIP-PREFIXES-V6"))
 }
 
 // TestBuildFRRConfigurationObjectsAllOptionalFields locks the full
@@ -69,14 +90,51 @@ func TestBuildFRRConfigurationObjectsAllOptionalFields(t *testing.T) {
 	g.Expect(neighbor["ebgpMultiHop"]).To(Equal(true))
 	g.Expect(neighbor["password"]).To(Equal("s3cret"))
 	g.Expect(neighbor["bfdProfile"]).To(Equal("vip-bfd"))
+	// Sessions only: advertisement is done via gated redistribution in
+	// rawConfig, never via toAdvertise/prefixes.
+	g.Expect(neighbor).NotTo(HaveKey("toAdvertise"))
+	_, found, err = uns.NestedStringSlice(routers[0].(map[string]interface{}), "prefixes")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeFalse())
 
-	routerPrefixes, found, err := uns.NestedStringSlice(routers[0].(map[string]interface{}), "prefixes")
+	rawConfig, found, err := uns.NestedString(objs[0].Object, "spec", "raw", "rawConfig")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeTrue())
-	g.Expect(routerPrefixes).To(ConsistOf("192.168.111.5/32", "192.168.111.4/32"))
+	g.Expect(rawConfig).To(ContainSubstring("redistribute table-direct 198 route-map BGP-VIP-ROUTES-V4"))
+	g.Expect(rawConfig).To(ContainSubstring("route-map BGP-VIP-ROUTES-V4 permit 10"))
+	g.Expect(rawConfig).To(ContainSubstring("route-map BGP-VIP-ROUTES-V4 deny 20"))
+	g.Expect(rawConfig).To(ContainSubstring("ip prefix-list BGP-VIP-PREFIXES-V4 seq 10 permit 192.168.111.5/32"))
+	g.Expect(rawConfig).To(ContainSubstring("ip prefix-list BGP-VIP-PREFIXES-V4 seq 20 permit 192.168.111.4/32"))
 
 	bfdProfiles, found, err := uns.NestedSlice(objs[0].Object, "spec", "bgp", "bfdProfiles")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeTrue())
 	g.Expect(bfdProfiles).To(HaveLen(1))
+}
+
+// TestBuildFRRConfigurationObjectsDualStack locks the general address-family
+// handling: VIPs containing ":" are IPv6 (/128) and go to the V6 route-map
+// and prefix-list; both families are emitted when both have VIPs.
+func TestBuildFRRConfigurationObjectsDualStack(t *testing.T) {
+	g := NewGomegaWithT(t)
+	raw := `{"localASN":64512,"defaultPeers":[{"peerAddress":"192.168.111.1","peerASN":64513}],"apiVIPs":["192.168.111.5","fd2e:6f44:5dd8::5"],"ingressVIPs":["192.168.111.4","fd2e:6f44:5dd8::4"]}`
+	var cfg bgpVIPConfigData
+	g.Expect(json.Unmarshal([]byte(raw), &cfg)).To(Succeed())
+
+	objs, err := buildFRRConfigurationObjects(cfg)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(objs).To(HaveLen(1))
+
+	rawConfig, found, err := uns.NestedString(objs[0].Object, "spec", "raw", "rawConfig")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(rawConfig).To(ContainSubstring("redistribute table-direct 198 route-map BGP-VIP-ROUTES-V4"))
+	g.Expect(rawConfig).To(ContainSubstring("redistribute table-direct 198 route-map BGP-VIP-ROUTES-V6"))
+	g.Expect(rawConfig).To(ContainSubstring("route-map BGP-VIP-ROUTES-V6 permit 10"))
+	g.Expect(rawConfig).To(ContainSubstring("match ipv6 address prefix-list BGP-VIP-PREFIXES-V6"))
+	g.Expect(rawConfig).To(ContainSubstring("route-map BGP-VIP-ROUTES-V6 deny 20"))
+	g.Expect(rawConfig).To(ContainSubstring("ip prefix-list BGP-VIP-PREFIXES-V4 seq 10 permit 192.168.111.5/32"))
+	g.Expect(rawConfig).To(ContainSubstring("ip prefix-list BGP-VIP-PREFIXES-V4 seq 20 permit 192.168.111.4/32"))
+	g.Expect(rawConfig).To(ContainSubstring("ipv6 prefix-list BGP-VIP-PREFIXES-V6 seq 10 permit fd2e:6f44:5dd8::5/128"))
+	g.Expect(rawConfig).To(ContainSubstring("ipv6 prefix-list BGP-VIP-PREFIXES-V6 seq 20 permit fd2e:6f44:5dd8::4/128"))
 }

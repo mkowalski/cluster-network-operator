@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"slices"
+	"strings"
 
 	configv1 "github.com/openshift/api/config/v1"
 	apifeatures "github.com/openshift/api/features"
@@ -98,28 +99,20 @@ func renderBGPVIPFRRConfiguration(client cnoclient.Client, bootstrapResult *boot
 
 // buildFRRConfigurationObjects constructs FRRConfiguration unstructured objects
 // from the parsed BGP VIP config data.
+//
+// The CR carries only the BGP sessions (neighbors, BFD). VIP advertisement
+// deliberately does NOT use CRD prefixes/toAdvertise: frr-k8s renders those
+// as unconditional `network` statements, which would bypass the kube-vip
+// health gate. Instead, advertisement happens exclusively via the rawConfig
+// redistribution of routing table 198 (see buildBGPVIPRawConfig), into which
+// kube-vip only installs routes for VIPs whose backends are healthy.
 func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, error) {
-	// Build VIP prefix list for toAdvertise.
-	prefixes := []interface{}{}
-	for _, vip := range cfg.APIVIPs {
-		prefixes = append(prefixes, vip+"/32")
-	}
-	for _, vip := range cfg.IngressVIPs {
-		prefixes = append(prefixes, vip+"/32")
-	}
-
 	// Build neighbors list.
 	neighbors := []interface{}{}
 	for _, peer := range cfg.DefaultPeers {
 		neighbor := map[string]interface{}{
 			"address": peer.PeerAddress,
 			"asn":     peer.PeerASN,
-			"toAdvertise": map[string]interface{}{
-				"allowed": map[string]interface{}{
-					"mode":     "filtered",
-					"prefixes": prefixes,
-				},
-			},
 		}
 		if peer.Password != "" {
 			neighbor["password"] = peer.Password
@@ -146,31 +139,18 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 		}
 	}
 
-	// Build raw config for redistribute table-direct 198.
-	rawConfig := fmt.Sprintf(`router bgp %d
- address-family ipv4 unicast
-  redistribute table-direct 198
- exit-address-family
- address-family ipv6 unicast
-  redistribute table-direct 198
- exit-address-family`, cfg.LocalASN)
-
 	spec := map[string]interface{}{
 		"bgp": map[string]interface{}{
 			"bfdProfiles": bfdProfiles,
 			"routers": []interface{}{
 				map[string]interface{}{
-					"asn": cfg.LocalASN,
-					// The frr-k8s validation webhook requires every prefix
-					// advertised to a neighbor to also be declared at the
-					// router level.
-					"prefixes":  prefixes,
+					"asn":       cfg.LocalASN,
 					"neighbors": neighbors,
 				},
 			},
 		},
 		"raw": map[string]interface{}{
-			"rawConfig": rawConfig,
+			"rawConfig": buildBGPVIPRawConfig(cfg),
 		},
 		"nodeSelector": map[string]interface{}{
 			"matchLabels": map[string]interface{}{
@@ -195,6 +175,54 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 	}
 
 	return []*uns.Unstructured{obj}, nil
+}
+
+// buildBGPVIPRawConfig renders the health-gated, leak-proof FRR raw config
+// that advertises the VIPs, mirroring the semantics of MCO's bootstrap
+// frr.conf.tmpl: redistribute routing table 198 (populated by kube-vip only
+// for VIPs with healthy backends) filtered through route-maps that permit
+// exactly the VIP prefixes and deny everything else. Address-family blocks,
+// route-maps, and prefix-lists are emitted only for families that have VIPs.
+// A VIP containing ":" is IPv6 (/128), otherwise IPv4 (/32).
+func buildBGPVIPRawConfig(cfg bgpVIPConfigData) string {
+	var v4Prefixes, v6Prefixes []string
+	for _, vip := range slices.Concat(cfg.APIVIPs, cfg.IngressVIPs) {
+		if strings.Contains(vip, ":") {
+			v6Prefixes = append(v6Prefixes, vip+"/128")
+		} else {
+			v4Prefixes = append(v4Prefixes, vip+"/32")
+		}
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "router bgp %d\n", cfg.LocalASN)
+	if len(v4Prefixes) > 0 {
+		b.WriteString(" address-family ipv4 unicast\n")
+		b.WriteString("  redistribute table-direct 198 route-map BGP-VIP-ROUTES-V4\n")
+		b.WriteString(" exit-address-family\n")
+	}
+	if len(v6Prefixes) > 0 {
+		b.WriteString(" address-family ipv6 unicast\n")
+		b.WriteString("  redistribute table-direct 198 route-map BGP-VIP-ROUTES-V6\n")
+		b.WriteString(" exit-address-family\n")
+	}
+	if len(v4Prefixes) > 0 {
+		b.WriteString("route-map BGP-VIP-ROUTES-V4 permit 10\n")
+		b.WriteString(" match ip address prefix-list BGP-VIP-PREFIXES-V4\n")
+		b.WriteString("route-map BGP-VIP-ROUTES-V4 deny 20\n")
+	}
+	if len(v6Prefixes) > 0 {
+		b.WriteString("route-map BGP-VIP-ROUTES-V6 permit 10\n")
+		b.WriteString(" match ipv6 address prefix-list BGP-VIP-PREFIXES-V6\n")
+		b.WriteString("route-map BGP-VIP-ROUTES-V6 deny 20\n")
+	}
+	for i, prefix := range v4Prefixes {
+		fmt.Fprintf(&b, "ip prefix-list BGP-VIP-PREFIXES-V4 seq %d permit %s\n", 10*(i+1), prefix)
+	}
+	for i, prefix := range v6Prefixes {
+		fmt.Fprintf(&b, "ipv6 prefix-list BGP-VIP-PREFIXES-V6 seq %d permit %s\n", 10*(i+1), prefix)
+	}
+	return strings.TrimSuffix(b.String(), "\n")
 }
 
 // checkBGPSessionsEstablished checks whether all BGPSessionState resources
