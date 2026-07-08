@@ -160,7 +160,11 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 			"bfdProfiles": bfdProfiles,
 			"routers": []interface{}{
 				map[string]interface{}{
-					"asn":       cfg.LocalASN,
+					"asn": cfg.LocalASN,
+					// The frr-k8s validation webhook requires every prefix
+					// advertised to a neighbor to also be declared at the
+					// router level.
+					"prefixes":  prefixes,
 					"neighbors": neighbors,
 				},
 			},

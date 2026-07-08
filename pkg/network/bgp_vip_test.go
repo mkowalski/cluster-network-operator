@@ -27,6 +27,14 @@ func TestBuildFRRConfigurationObjects(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeTrue())
 	g.Expect(neighbors).To(HaveLen(1))
+
+	// The VIP prefixes must be declared at router level as well: the frr-k8s
+	// validation webhook rejects advertising prefixes not configured on the
+	// router.
+	routerPrefixes, found, err := uns.NestedStringSlice(routers[0].(map[string]interface{}), "prefixes")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(routerPrefixes).To(ConsistOf("192.168.111.5/32", "192.168.111.4/32"))
 }
 
 // TestBuildFRRConfigurationObjectsAllOptionalFields locks the full
@@ -61,6 +69,11 @@ func TestBuildFRRConfigurationObjectsAllOptionalFields(t *testing.T) {
 	g.Expect(neighbor["ebgpMultiHop"]).To(Equal(true))
 	g.Expect(neighbor["password"]).To(Equal("s3cret"))
 	g.Expect(neighbor["bfdProfile"]).To(Equal("vip-bfd"))
+
+	routerPrefixes, found, err := uns.NestedStringSlice(routers[0].(map[string]interface{}), "prefixes")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(routerPrefixes).To(ConsistOf("192.168.111.5/32", "192.168.111.4/32"))
 
 	bfdProfiles, found, err := uns.NestedSlice(objs[0].Object, "spec", "bgp", "bfdProfiles")
 	g.Expect(err).NotTo(HaveOccurred())

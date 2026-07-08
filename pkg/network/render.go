@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 
@@ -129,7 +130,7 @@ func Render(operConf *operv1.NetworkSpec, clusterConf *configv1.NetworkSpec, man
 	}
 	objs = append(objs, o...)
 
-	o, err = renderAdditionalRoutingCapabilities(operConf, manifestDir)
+	o, err = renderAdditionalRoutingCapabilities(operConf, manifestDir, bootstrapResult, featureGates)
 	if err != nil {
 		return nil, progressing, err
 	}
@@ -856,9 +857,18 @@ func registerNetworkingConsolePlugin(bootstrapResult *bootstrap.BootstrapResult,
 	})
 }
 
-func renderAdditionalRoutingCapabilities(conf *operv1.NetworkSpec, manifestDir string) ([]*uns.Unstructured, error) {
+func renderAdditionalRoutingCapabilities(conf *operv1.NetworkSpec, manifestDir string, bootstrapResult *bootstrap.BootstrapResult, featureGates featuregates.FeatureGate) ([]*uns.Unstructured, error) {
 	if conf == nil || conf.AdditionalRoutingCapabilities == nil {
 		return nil, nil
+	}
+	// Under BGP VIP management the static FRR pods own the control plane
+	// nodes, so the frr-k8s DaemonSet must avoid masters by role.
+	bgpVIP := false
+	if bootstrapResult != nil && bootstrapResult.Infra.PlatformStatus != nil &&
+		bootstrapResult.Infra.PlatformStatus.BareMetal != nil &&
+		slices.Contains(featureGates.KnownFeatures(), apifeatures.FeatureGateBGPBasedVIPManagement) &&
+		featureGates.Enabled(apifeatures.FeatureGateBGPBasedVIPManagement) {
+		bgpVIP = bootstrapResult.Infra.PlatformStatus.BareMetal.VIPManagement == "BGP"
 	}
 	var out []*uns.Unstructured
 	for _, provider := range conf.AdditionalRoutingCapabilities.Providers {
@@ -869,6 +879,7 @@ func renderAdditionalRoutingCapabilities(conf *operv1.NetworkSpec, manifestDir s
 			data.Data["ReleaseVersion"] = os.Getenv("RELEASE_VERSION")
 			data.Data["NoOverlayManagedEnabled"] = conf.DefaultNetwork.OVNKubernetesConfig != nil &&
 				conf.DefaultNetwork.OVNKubernetesConfig.BGPManagedConfig.BGPTopology != ""
+			data.Data["BGPVIPManagement"] = bgpVIP
 			objs, err := render.RenderDir(filepath.Join(manifestDir, "network/frr-k8s"), &data)
 			if err != nil {
 				return nil, fmt.Errorf("failed to render frr-k8s manifests: %w", err)
