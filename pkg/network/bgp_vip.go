@@ -7,9 +7,11 @@ import (
 	"log"
 
 	configv1 "github.com/openshift/api/config/v1"
+	apifeatures "github.com/openshift/api/features"
 	"github.com/openshift/cluster-network-operator/pkg/bootstrap"
 	cnoclient "github.com/openshift/cluster-network-operator/pkg/client"
 	"github.com/openshift/cluster-network-operator/pkg/names"
+	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -28,22 +30,21 @@ type bgpVIPPeer struct {
 	KeepaliveTime string `json:"keepaliveTime,omitempty"`
 }
 
-// bgpVIPConfigData is the parsed content of the bgp-vip-config ConfigMap's config.json key.
+// bgpVIPConfigData is the parsed content of the bgp-vip-config ConfigMap's
+// config.json key. The schema matches baremetal-runtimecfg's FRRPeerMapping.
 type bgpVIPConfigData struct {
-	LocalASN    int64          `json:"localASN"`
-	Peers       []bgpVIPPeer   `json:"peers"`
-	Communities []string       `json:"communities,omitempty"`
-	APIVIPs     []string       `json:"apiVIPs"`
-	IngressVIPs []string       `json:"ingressVIPs"`
-	// HostOverrides allows per-node peer configuration.
-	HostOverrides map[string]struct {
-		Peers []bgpVIPPeer `json:"peers"`
-	} `json:"hostOverrides,omitempty"`
+	LocalASN      int64                   `json:"localASN"`
+	DefaultPeers  []bgpVIPPeer            `json:"defaultPeers"`
+	Communities   []string                `json:"communities,omitempty"`
+	APIVIPs       []string                `json:"apiVIPs"`
+	IngressVIPs   []string                `json:"ingressVIPs"`
+	HostOverrides map[string][]bgpVIPPeer `json:"hostOverrides,omitempty"`
 }
 
 // renderBGPVIPFRRConfiguration builds FRRConfiguration CRs for BGP-managed VIPs.
-// It is a no-op when the platform is not BareMetal or VIPManagement is not "BGP".
-func renderBGPVIPFRRConfiguration(client cnoclient.Client, bootstrapResult *bootstrap.BootstrapResult) ([]*uns.Unstructured, error) {
+// It is a no-op when the BGPBasedVIPManagement feature gate is disabled, the
+// platform is not BareMetal, or VIPManagement is not "BGP".
+func renderBGPVIPFRRConfiguration(client cnoclient.Client, bootstrapResult *bootstrap.BootstrapResult, featureGates featuregates.FeatureGate) ([]*uns.Unstructured, error) {
 	if bootstrapResult == nil || bootstrapResult.Infra.PlatformStatus == nil {
 		return nil, nil
 	}
@@ -54,13 +55,10 @@ func renderBGPVIPFRRConfiguration(client cnoclient.Client, bootstrapResult *boot
 		return nil, nil
 	}
 
-	// VIPManagement is not yet in the vendored configv1 types, so read the
-	// Infrastructure CR as unstructured to check for the field.
-	isBGP, err := isBGPVIPManagement(client)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check VIPManagement mode: %v", err)
+	if !featureGates.Enabled(apifeatures.FeatureGateBGPBasedVIPManagement) {
+		return nil, nil
 	}
-	if !isBGP {
+	if bootstrapResult.Infra.PlatformStatus.BareMetal.VIPManagement != "BGP" {
 		return nil, nil
 	}
 
@@ -68,7 +66,7 @@ func renderBGPVIPFRRConfiguration(client cnoclient.Client, bootstrapResult *boot
 
 	// Read the bgp-vip-config ConfigMap.
 	cm := &corev1.ConfigMap{}
-	err = client.Default().CRClient().Get(context.TODO(),
+	err := client.Default().CRClient().Get(context.TODO(),
 		types.NamespacedName{Name: "bgp-vip-config", Namespace: names.APPLIED_NAMESPACE}, cm)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
@@ -92,28 +90,6 @@ func renderBGPVIPFRRConfiguration(client cnoclient.Client, bootstrapResult *boot
 	return buildFRRConfigurationObjects(bgpConfig)
 }
 
-// isBGPVIPManagement reads the Infrastructure CR as unstructured and checks
-// whether .status.platformStatus.baremetal.vipManagement is set to "BGP".
-func isBGPVIPManagement(client cnoclient.Client) (bool, error) {
-	infra := &uns.Unstructured{}
-	infra.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "config.openshift.io",
-		Version: "v1",
-		Kind:    "Infrastructure",
-	})
-	if err := client.Default().CRClient().Get(context.TODO(),
-		types.NamespacedName{Name: "cluster"}, infra); err != nil {
-		return false, fmt.Errorf("failed to get Infrastructure CR: %v", err)
-	}
-
-	val, found, err := uns.NestedString(infra.Object,
-		"status", "platformStatus", "baremetal", "vipManagement")
-	if err != nil || !found {
-		return false, nil
-	}
-	return val == "BGP", nil
-}
-
 // buildFRRConfigurationObjects constructs FRRConfiguration unstructured objects
 // from the parsed BGP VIP config data.
 func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, error) {
@@ -128,7 +104,7 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 
 	// Build neighbors list.
 	neighbors := []interface{}{}
-	for _, peer := range cfg.Peers {
+	for _, peer := range cfg.DefaultPeers {
 		neighbor := map[string]interface{}{
 			"address": peer.PeerAddress,
 			"asn":     peer.PeerASN,
@@ -153,7 +129,7 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 
 	// Build BFD profiles if any peer uses BFD.
 	bfdProfiles := []interface{}{}
-	for _, peer := range cfg.Peers {
+	for _, peer := range cfg.DefaultPeers {
 		if peer.BFDEnabled == "true" {
 			bfdProfiles = append(bfdProfiles, map[string]interface{}{
 				"name":             "vip-bfd",
