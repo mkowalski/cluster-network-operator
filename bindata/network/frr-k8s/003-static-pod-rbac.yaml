@@ -3,7 +3,10 @@
 # containers authenticate with the node kubeconfig
 # (/etc/kubernetes/kubeconfig), whose identity is the MCO node-bootstrapper
 # ServiceAccount (verified live via oc auth whoami). Grant it read access to
-# FRRConfigurations/FRRK8sConfigurations and write access to node state CRs.
+# FRRConfigurations/FRRK8sConfigurations and write access to node state CRs,
+# plus the namespace-scoped reads (secrets for BGP session passwords, pods)
+# that 002-rbac.yaml grants the DaemonSet service account, so the
+# controller's informer caches can sync.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -56,6 +59,46 @@ metadata:
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
+  name: frr-k8s-static-pod
+subjects:
+- kind: ServiceAccount
+  name: node-bootstrapper
+  namespace: openshift-machine-config-operator
+---
+# Namespace-scoped reads mirroring the DaemonSet SA's Role in 002-rbac.yaml
+# (read-only: the static pod controller watches Secrets for BGP session
+# passwords and pods; it does not need the DaemonSet's secrets update grant).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: frr-k8s-static-pod
+  namespace: openshift-frr-k8s
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: frr-k8s-static-pod
+  namespace: openshift-frr-k8s
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
   name: frr-k8s-static-pod
 subjects:
 - kind: ServiceAccount

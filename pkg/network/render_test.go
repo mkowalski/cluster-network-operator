@@ -594,7 +594,7 @@ func Test_renderAdditionalRoutingCapabilities(t *testing.T) {
 					},
 				},
 			},
-			want:        23,
+			want:        25,
 			expectedErr: nil,
 		},
 	}
@@ -654,7 +654,7 @@ func Test_renderAdditionalRoutingCapabilitiesBGPVIPManagement(t *testing.T) {
 	// BGP VIP management active: the DaemonSet must avoid masters by role.
 	got, err := renderAdditionalRoutingCapabilities(operConf, manifestDir, bootstrapResult, featureGates)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(got).To(HaveLen(23))
+	g.Expect(got).To(HaveLen(25))
 	affinity, found := daemonSetAffinity(got)
 	g.Expect(found).To(BeTrue())
 	terms, found, err := uns.NestedSlice(affinity, "nodeAffinity", "requiredDuringSchedulingIgnoredDuringExecution", "nodeSelectorTerms")
@@ -671,7 +671,7 @@ func Test_renderAdditionalRoutingCapabilitiesBGPVIPManagement(t *testing.T) {
 	// BGP VIP management inactive (nil bootstrap result): no affinity.
 	got, err = renderAdditionalRoutingCapabilities(operConf, manifestDir, nil, featureGates)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(got).To(HaveLen(23))
+	g.Expect(got).To(HaveLen(25))
 	_, found = daemonSetAffinity(got)
 	g.Expect(found).To(BeFalse())
 }
