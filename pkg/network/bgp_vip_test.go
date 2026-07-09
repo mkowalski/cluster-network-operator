@@ -36,15 +36,12 @@ func TestBuildFRRConfigurationObjects(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeFalse())
 	neighbor := neighbors[0].(map[string]interface{})
-	// Egress must be opened explicitly: frr-k8s renders deny-all outbound
-	// route-maps when toAdvertise is absent. mode=all is safe because the
-	// filtered table-direct redistribution is the ingress filter, so only
-	// the VIP prefixes exist in the BGP table to advertise.
-	mode, found, err := uns.NestedString(neighbor, "toAdvertise", "allowed", "mode")
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(found).To(BeTrue())
-	g.Expect(mode).To(Equal("all"))
-	_, found, err = uns.NestedStringSlice(neighbor, "toAdvertise", "allowed", "prefixes")
+	// No toAdvertise at all: the CRD cannot express "advertise redistributed
+	// routes" (allowed mode=all only covers prefixes statically declared in
+	// router.prefixes and renders deny-any lists otherwise). Egress is opened
+	// instead by rawConfig permits appended to the generated <peer>-out
+	// route-maps, asserted below.
+	_, found, err = uns.NestedMap(neighbor, "toAdvertise")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeFalse())
 	g.Expect(neighbor["address"]).To(Equal("192.168.111.1"))
@@ -65,8 +62,14 @@ func TestBuildFRRConfigurationObjects(t *testing.T) {
 	g.Expect(rawConfig).To(ContainSubstring("route-map BGP-VIP-ROUTES-V4 deny 20"))
 	g.Expect(rawConfig).To(ContainSubstring("ip prefix-list BGP-VIP-PREFIXES-V4 seq 10 permit 192.168.111.5/32"))
 	g.Expect(rawConfig).To(ContainSubstring("ip prefix-list BGP-VIP-PREFIXES-V4 seq 20 permit 192.168.111.4/32"))
-	// No IPv6 VIPs: the v6 address-family, route-map, and prefix-list blocks
-	// must be omitted entirely.
+	// Egress: frr-k8s renders per-neighbor <peer>-out route-maps whose own
+	// permit seqs match deny-any prefix-lists (no toAdvertise); a prefix-list
+	// deny is a no-match, so processing falls through to these appended
+	// high-seq permits, opening egress ONLY for the VIP prefix-lists.
+	g.Expect(rawConfig).To(ContainSubstring("route-map 192.168.111.1-out permit 4000\n match ip address prefix-list BGP-VIP-PREFIXES-V4"))
+	// No IPv6 VIPs: the v6 address-family, route-map, prefix-list, and
+	// egress-permit blocks must be omitted entirely.
+	g.Expect(rawConfig).NotTo(ContainSubstring("-out permit 4001"))
 	g.Expect(rawConfig).NotTo(ContainSubstring("address-family ipv6"))
 	g.Expect(rawConfig).NotTo(ContainSubstring("BGP-VIP-ROUTES-V6"))
 	g.Expect(rawConfig).NotTo(ContainSubstring("BGP-VIP-PREFIXES-V6"))
@@ -104,15 +107,11 @@ func TestBuildFRRConfigurationObjectsAllOptionalFields(t *testing.T) {
 	g.Expect(neighbor["ebgpMultiHop"]).To(Equal(true))
 	g.Expect(neighbor["password"]).To(Equal("s3cret"))
 	g.Expect(neighbor["bfdProfile"]).To(Equal("vip-bfd"))
-	// Sessions carry permit-all egress (frr-k8s renders deny-all outbound
-	// route-maps when toAdvertise is absent), but advertisement content is
-	// still controlled exclusively by gated redistribution in rawConfig:
-	// no prefixes list under toAdvertise, no router-level prefixes.
-	mode, found, err := uns.NestedString(neighbor, "toAdvertise", "allowed", "mode")
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(found).To(BeTrue())
-	g.Expect(mode).To(Equal("all"))
-	_, found, err = uns.NestedStringSlice(neighbor, "toAdvertise", "allowed", "prefixes")
+	// No toAdvertise (CRD egress surface cannot cover redistributed routes);
+	// advertisement content is controlled exclusively by gated redistribution
+	// plus the appended <peer>-out egress permits in rawConfig. No router-level
+	// prefixes either.
+	_, found, err = uns.NestedMap(neighbor, "toAdvertise")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeFalse())
 	_, found, err = uns.NestedStringSlice(routers[0].(map[string]interface{}), "prefixes")
@@ -128,6 +127,7 @@ func TestBuildFRRConfigurationObjectsAllOptionalFields(t *testing.T) {
 	g.Expect(rawConfig).To(ContainSubstring("route-map BGP-VIP-ROUTES-V4 deny 20"))
 	g.Expect(rawConfig).To(ContainSubstring("ip prefix-list BGP-VIP-PREFIXES-V4 seq 10 permit 192.168.111.5/32"))
 	g.Expect(rawConfig).To(ContainSubstring("ip prefix-list BGP-VIP-PREFIXES-V4 seq 20 permit 192.168.111.4/32"))
+	g.Expect(rawConfig).To(ContainSubstring("route-map 192.168.111.1-out permit 4000\n match ip address prefix-list BGP-VIP-PREFIXES-V4"))
 
 	bfdProfiles, found, err := uns.NestedSlice(objs[0].Object, "spec", "bgp", "bfdProfiles")
 	g.Expect(err).NotTo(HaveOccurred())
@@ -161,4 +161,8 @@ func TestBuildFRRConfigurationObjectsDualStack(t *testing.T) {
 	g.Expect(rawConfig).To(ContainSubstring("ip prefix-list BGP-VIP-PREFIXES-V4 seq 20 permit 192.168.111.4/32"))
 	g.Expect(rawConfig).To(ContainSubstring("ipv6 prefix-list BGP-VIP-PREFIXES-V6 seq 10 permit fd2e:6f44:5dd8::5/128"))
 	g.Expect(rawConfig).To(ContainSubstring("ipv6 prefix-list BGP-VIP-PREFIXES-V6 seq 20 permit fd2e:6f44:5dd8::4/128"))
+	// Both families have VIPs: the peer's egress route-map gets both the v4
+	// and v6 high-seq permits.
+	g.Expect(rawConfig).To(ContainSubstring("route-map 192.168.111.1-out permit 4000\n match ip address prefix-list BGP-VIP-PREFIXES-V4"))
+	g.Expect(rawConfig).To(ContainSubstring("route-map 192.168.111.1-out permit 4001\n match ipv6 address prefix-list BGP-VIP-PREFIXES-V6"))
 }

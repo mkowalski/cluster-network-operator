@@ -100,13 +100,17 @@ func renderBGPVIPFRRConfiguration(client cnoclient.Client, bootstrapResult *boot
 // buildFRRConfigurationObjects constructs FRRConfiguration unstructured objects
 // from the parsed BGP VIP config data.
 //
-// The CR carries the BGP sessions (neighbors, BFD) with permit-all egress.
-// VIP advertisement deliberately does NOT use CRD prefixes/toAdvertise
-// prefix lists: frr-k8s renders those as unconditional `network` statements,
-// which would bypass the kube-vip health gate. Instead, advertisement
-// happens exclusively via the rawConfig redistribution of routing table 198
-// (see buildBGPVIPRawConfig), into which kube-vip only installs routes for
-// VIPs whose backends are healthy.
+// The CR carries the BGP sessions (neighbors, BFD) only. VIP advertisement
+// deliberately does NOT use CRD prefixes/toAdvertise: frr-k8s renders
+// router-level prefixes as unconditional `network` statements (bypassing the
+// kube-vip health gate), and toAdvertise cannot express "advertise
+// redistributed routes" at all - allowed mode=all only permits prefixes
+// statically declared in router.prefixes and renders deny-any prefix-lists
+// otherwise. Instead, advertisement happens exclusively via the rawConfig
+// redistribution of routing table 198 (see buildBGPVIPRawConfig), into which
+// kube-vip only installs routes for VIPs whose backends are healthy, and
+// egress is opened by rawConfig permits appended to the per-neighbor
+// <peer>-out route-maps that frr-k8s always renders.
 func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, error) {
 	// Build neighbors list.
 	neighbors := []interface{}{}
@@ -114,18 +118,6 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 		neighbor := map[string]interface{}{
 			"address": peer.PeerAddress,
 			"asn":     peer.PeerASN,
-			// frr-k8s renders deny-all per-neighbor outbound route-maps when
-			// toAdvertise is absent, so egress must be opened explicitly.
-			// mode=all is safe because this FRR instance is VIP-dedicated:
-			// the filtered `redistribute table-direct 198` rawConfig is the
-			// ingress filter and nothing else feeds this BGP table, so only
-			// the VIP prefixes exist to advertise. Revisit if the static pod
-			// ever merges additional consumers.
-			"toAdvertise": map[string]interface{}{
-				"allowed": map[string]interface{}{
-					"mode": "all",
-				},
-			},
 		}
 		if peer.Password != "" {
 			neighbor["password"] = peer.Password
@@ -194,8 +186,10 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 // that advertises the VIPs, mirroring the semantics of MCO's bootstrap
 // frr.conf.tmpl: redistribute routing table 198 (populated by kube-vip only
 // for VIPs with healthy backends) filtered through route-maps that permit
-// exactly the VIP prefixes and deny everything else. Address-family blocks,
-// route-maps, and prefix-lists are emitted only for families that have VIPs.
+// exactly the VIP prefixes and deny everything else, plus per-peer egress
+// permits appended to the frr-k8s-generated <peer>-out route-maps.
+// Address-family blocks, route-maps, prefix-lists, and egress permits are
+// emitted only for families that have VIPs.
 // A VIP containing ":" is IPv6 (/128), otherwise IPv4 (/32).
 func buildBGPVIPRawConfig(cfg bgpVIPConfigData) string {
 	var v4Prefixes, v6Prefixes []string
@@ -240,6 +234,29 @@ func buildBGPVIPRawConfig(cfg bgpVIPConfigData) string {
 	}
 	for i, prefix := range v6Prefixes {
 		fmt.Fprintf(&b, "ipv6 prefix-list BGP-VIP-PREFIXES-V6 seq %d permit %s\n", 10*(i+1), prefix)
+	}
+	// Open egress for exactly the VIP prefixes. frr-k8s always renders a
+	// per-neighbor `route-map <peer>-out` (for non-VRF, non-interface peers
+	// the neighbor ID naming the map is the peer address, see frr-k8s
+	// internal/frr/config.go NeighborConfig.ID); with no toAdvertise its own
+	// permit seqs match deny-any prefix-lists, because the CRD cannot express
+	// "advertise redistributed routes" - allowed mode=all only covers
+	// prefixes statically declared in router.prefixes (see frr-k8s
+	// internal/controller/api_to_config.go prefixesToAdvertiseForFamily).
+	// A route-map entry whose prefix-list denies is a no-match, which falls
+	// through to the NEXT sequence rather than rejecting, so these high-seq
+	// permits open egress ONLY for the VIP prefix-lists while everything
+	// else stays implicitly denied - health-gated by the table-direct
+	// redistribution above and leak-proof.
+	for _, peer := range cfg.DefaultPeers {
+		if len(v4Prefixes) > 0 {
+			fmt.Fprintf(&b, "route-map %s-out permit 4000\n", peer.PeerAddress)
+			b.WriteString(" match ip address prefix-list BGP-VIP-PREFIXES-V4\n")
+		}
+		if len(v6Prefixes) > 0 {
+			fmt.Fprintf(&b, "route-map %s-out permit 4001\n", peer.PeerAddress)
+			b.WriteString(" match ipv6 address prefix-list BGP-VIP-PREFIXES-V6\n")
+		}
 	}
 	return strings.TrimSuffix(b.String(), "\n")
 }
