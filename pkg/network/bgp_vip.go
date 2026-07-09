@@ -208,6 +208,12 @@ func buildBGPVIPRawConfig(cfg bgpVIPConfigData) string {
 	}
 
 	var b strings.Builder
+	// Zebra only tracks kernel routing tables other than main when
+	// explicitly instructed. Without import-table zebra never sees the
+	// kube-vip routes in table 198 and the table-direct redistribution
+	// below exports nothing. The bootstrap config (MCO's
+	// manifests/on-prem/frr.conf.tmpl) carries the same directive.
+	b.WriteString("ip import-table 198\n")
 	fmt.Fprintf(&b, "router bgp %d\n", cfg.LocalASN)
 	if len(v4Prefixes) > 0 {
 		b.WriteString(" address-family ipv4 unicast\n")

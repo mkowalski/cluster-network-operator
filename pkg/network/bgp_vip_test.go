@@ -55,6 +55,9 @@ func TestBuildFRRConfigurationObjects(t *testing.T) {
 	rawConfig, found, err := uns.NestedString(objs[0].Object, "spec", "raw", "rawConfig")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeTrue())
+	// Zebra only tracks non-main kernel tables when told to: without
+	// import-table the table-direct redistribution exports nothing.
+	g.Expect(rawConfig).To(HavePrefix("ip import-table 198\n"))
 	g.Expect(rawConfig).To(ContainSubstring("router bgp 64512"))
 	g.Expect(rawConfig).To(ContainSubstring("redistribute table-direct 198 route-map BGP-VIP-ROUTES-V4"))
 	g.Expect(rawConfig).To(ContainSubstring("route-map BGP-VIP-ROUTES-V4 permit 10"))
@@ -119,6 +122,7 @@ func TestBuildFRRConfigurationObjectsAllOptionalFields(t *testing.T) {
 	rawConfig, found, err := uns.NestedString(objs[0].Object, "spec", "raw", "rawConfig")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeTrue())
+	g.Expect(rawConfig).To(HavePrefix("ip import-table 198\n"))
 	g.Expect(rawConfig).To(ContainSubstring("redistribute table-direct 198 route-map BGP-VIP-ROUTES-V4"))
 	g.Expect(rawConfig).To(ContainSubstring("route-map BGP-VIP-ROUTES-V4 permit 10"))
 	g.Expect(rawConfig).To(ContainSubstring("route-map BGP-VIP-ROUTES-V4 deny 20"))
@@ -147,6 +151,7 @@ func TestBuildFRRConfigurationObjectsDualStack(t *testing.T) {
 	rawConfig, found, err := uns.NestedString(objs[0].Object, "spec", "raw", "rawConfig")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeTrue())
+	g.Expect(rawConfig).To(HavePrefix("ip import-table 198\n"))
 	g.Expect(rawConfig).To(ContainSubstring("redistribute table-direct 198 route-map BGP-VIP-ROUTES-V4"))
 	g.Expect(rawConfig).To(ContainSubstring("redistribute table-direct 198 route-map BGP-VIP-ROUTES-V6"))
 	g.Expect(rawConfig).To(ContainSubstring("route-map BGP-VIP-ROUTES-V6 permit 10"))
