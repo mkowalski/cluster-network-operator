@@ -30,12 +30,23 @@ func TestBuildFRRConfigurationObjects(t *testing.T) {
 
 	// VIP advertisement must NOT use CRD prefixes: frr-k8s renders those as
 	// unconditional `network` statements, which bypass the kube-vip health
-	// gate (routing table 198). No router-level prefixes, no toAdvertise.
+	// gate (routing table 198). No router-level prefixes, no prefixes list
+	// under toAdvertise.
 	_, found, err = uns.NestedStringSlice(routers[0].(map[string]interface{}), "prefixes")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeFalse())
 	neighbor := neighbors[0].(map[string]interface{})
-	g.Expect(neighbor).NotTo(HaveKey("toAdvertise"))
+	// Egress must be opened explicitly: frr-k8s renders deny-all outbound
+	// route-maps when toAdvertise is absent. mode=all is safe because the
+	// filtered table-direct redistribution is the ingress filter, so only
+	// the VIP prefixes exist in the BGP table to advertise.
+	mode, found, err := uns.NestedString(neighbor, "toAdvertise", "allowed", "mode")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(mode).To(Equal("all"))
+	_, found, err = uns.NestedStringSlice(neighbor, "toAdvertise", "allowed", "prefixes")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeFalse())
 	g.Expect(neighbor["address"]).To(Equal("192.168.111.1"))
 	g.Expect(neighbor["asn"]).To(Equal(int64(64513)))
 
@@ -90,9 +101,17 @@ func TestBuildFRRConfigurationObjectsAllOptionalFields(t *testing.T) {
 	g.Expect(neighbor["ebgpMultiHop"]).To(Equal(true))
 	g.Expect(neighbor["password"]).To(Equal("s3cret"))
 	g.Expect(neighbor["bfdProfile"]).To(Equal("vip-bfd"))
-	// Sessions only: advertisement is done via gated redistribution in
-	// rawConfig, never via toAdvertise/prefixes.
-	g.Expect(neighbor).NotTo(HaveKey("toAdvertise"))
+	// Sessions carry permit-all egress (frr-k8s renders deny-all outbound
+	// route-maps when toAdvertise is absent), but advertisement content is
+	// still controlled exclusively by gated redistribution in rawConfig:
+	// no prefixes list under toAdvertise, no router-level prefixes.
+	mode, found, err := uns.NestedString(neighbor, "toAdvertise", "allowed", "mode")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeTrue())
+	g.Expect(mode).To(Equal("all"))
+	_, found, err = uns.NestedStringSlice(neighbor, "toAdvertise", "allowed", "prefixes")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeFalse())
 	_, found, err = uns.NestedStringSlice(routers[0].(map[string]interface{}), "prefixes")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeFalse())

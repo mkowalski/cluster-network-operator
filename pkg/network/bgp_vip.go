@@ -100,12 +100,13 @@ func renderBGPVIPFRRConfiguration(client cnoclient.Client, bootstrapResult *boot
 // buildFRRConfigurationObjects constructs FRRConfiguration unstructured objects
 // from the parsed BGP VIP config data.
 //
-// The CR carries only the BGP sessions (neighbors, BFD). VIP advertisement
-// deliberately does NOT use CRD prefixes/toAdvertise: frr-k8s renders those
-// as unconditional `network` statements, which would bypass the kube-vip
-// health gate. Instead, advertisement happens exclusively via the rawConfig
-// redistribution of routing table 198 (see buildBGPVIPRawConfig), into which
-// kube-vip only installs routes for VIPs whose backends are healthy.
+// The CR carries the BGP sessions (neighbors, BFD) with permit-all egress.
+// VIP advertisement deliberately does NOT use CRD prefixes/toAdvertise
+// prefix lists: frr-k8s renders those as unconditional `network` statements,
+// which would bypass the kube-vip health gate. Instead, advertisement
+// happens exclusively via the rawConfig redistribution of routing table 198
+// (see buildBGPVIPRawConfig), into which kube-vip only installs routes for
+// VIPs whose backends are healthy.
 func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, error) {
 	// Build neighbors list.
 	neighbors := []interface{}{}
@@ -113,6 +114,18 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 		neighbor := map[string]interface{}{
 			"address": peer.PeerAddress,
 			"asn":     peer.PeerASN,
+			// frr-k8s renders deny-all per-neighbor outbound route-maps when
+			// toAdvertise is absent, so egress must be opened explicitly.
+			// mode=all is safe because this FRR instance is VIP-dedicated:
+			// the filtered `redistribute table-direct 198` rawConfig is the
+			// ingress filter and nothing else feeds this BGP table, so only
+			// the VIP prefixes exist to advertise. Revisit if the static pod
+			// ever merges additional consumers.
+			"toAdvertise": map[string]interface{}{
+				"allowed": map[string]interface{}{
+					"mode": "all",
+				},
+			},
 		}
 		if peer.Password != "" {
 			neighbor["password"] = peer.Password
