@@ -111,6 +111,14 @@ func renderBGPVIPFRRConfiguration(client cnoclient.Client, bootstrapResult *boot
 // kube-vip only installs routes for VIPs whose backends are healthy, and
 // egress is opened by rawConfig permits appended to the per-neighbor
 // <peer>-out route-maps that frr-k8s always renders.
+//
+// The CR carries no node selector, so it applies cluster-wide: the masters'
+// static-pod controller and the workers' frr-k8s DaemonSet consume the same
+// sessions and gated redistribution. Advertisement stays correct per node
+// because it is health-gated: the ingress VIP route only exists in table 198
+// on nodes whose router healthz passes, so only router-bearing nodes
+// advertise it, and the API VIP route only ever exists on masters
+// (kube-vip-api is master-only).
 func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, error) {
 	// Build neighbors list.
 	neighbors := []interface{}{}
@@ -157,11 +165,6 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 		"raw": map[string]interface{}{
 			"rawConfig": buildBGPVIPRawConfig(cfg),
 		},
-		"nodeSelector": map[string]interface{}{
-			"matchLabels": map[string]interface{}{
-				"node-role.kubernetes.io/master": "",
-			},
-		},
 	}
 
 	obj := &uns.Unstructured{
@@ -169,7 +172,7 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 			"apiVersion": "frrk8s.metallb.io/v1beta1",
 			"kind":       "FRRConfiguration",
 			"metadata": map[string]interface{}{
-				"name":      "bgp-vip-master",
+				"name":      "bgp-vip",
 				"namespace": "openshift-frr-k8s",
 				"labels": map[string]interface{}{
 					"app.kubernetes.io/managed-by": "cluster-network-operator",

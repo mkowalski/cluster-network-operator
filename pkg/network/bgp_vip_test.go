@@ -18,7 +18,12 @@ func TestBuildFRRConfigurationObjects(t *testing.T) {
 	objs, err := buildFRRConfigurationObjects(cfg)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(objs).To(HaveLen(1))
-	g.Expect(objs[0].GetName()).To(Equal("bgp-vip-master"))
+	g.Expect(objs[0].GetName()).To(Equal("bgp-vip"))
+	// No node selector: the CR applies to all nodes so workers' frr-k8s
+	// DaemonSet consumes the same sessions and gated redistribution.
+	_, found, err := uns.NestedMap(objs[0].Object, "spec", "nodeSelector")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(found).To(BeFalse())
 	routers, found, err := uns.NestedSlice(objs[0].Object, "spec", "bgp", "routers")
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(found).To(BeTrue())
