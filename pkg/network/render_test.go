@@ -654,7 +654,7 @@ func Test_renderAdditionalRoutingCapabilitiesBGPVIPManagement(t *testing.T) {
 	// BGP VIP management active: the DaemonSet must avoid masters by role.
 	got, err := renderAdditionalRoutingCapabilities(operConf, manifestDir, bootstrapResult, featureGates)
 	g.Expect(err).NotTo(HaveOccurred())
-	g.Expect(got).To(HaveLen(25))
+	g.Expect(got).To(HaveLen(28))
 	affinity, found := daemonSetAffinity(got)
 	g.Expect(found).To(BeTrue())
 	terms, found, err := uns.NestedSlice(affinity, "nodeAffinity", "requiredDuringSchedulingIgnoredDuringExecution", "nodeSelectorTerms")
