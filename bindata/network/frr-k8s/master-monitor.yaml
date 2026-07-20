@@ -25,7 +25,6 @@ spec:
         component: frr-k8s-master-monitor
     spec:
       serviceAccountName: frr-k8s-daemon
-      hostNetwork: true
       nodeSelector:
         kubernetes.io/os: linux
         node-role.kubernetes.io/master: ""
@@ -35,6 +34,13 @@ spec:
       - name: cp-metrics
         image: {{.FRRK8sImage}}
         command: ["/bin/sh", "-c", "cp -f /frr-metrics /etc/frr_metrics/"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+          seccompProfile:
+            type: RuntimeDefault
         terminationMessagePolicy: FallbackToLogsOnError
         volumeMounts:
         - name: metrics
@@ -51,6 +57,26 @@ spec:
         ports:
         - containerPort: 9141
           name: frrmetricshttps
+        # Root without extra capabilities except DAC_OVERRIDE: vtysh requires
+        # root, and the FRR vty sockets are owned by the frr user (100).
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+            add: ["DAC_OVERRIDE"]
+          seccompProfile:
+            type: RuntimeDefault
+        readinessProbe:
+          tcpSocket:
+            port: 9141
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          tcpSocket:
+            port: 9141
+          initialDelaySeconds: 10
+          periodSeconds: 30
         resources:
           requests:
             cpu: 10m
@@ -102,6 +128,37 @@ spec:
     targetPort: 9141
   sessionAffinity: None
   type: ClusterIP
+---
+# The namespace carries a default-deny NetworkPolicy; the worker DaemonSet
+# is exempt as hostNetwork, the pod-network companion is not.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frr-k8s-master-monitor
+  namespace: openshift-frr-k8s
+spec:
+  podSelector:
+    matchLabels:
+      component: frr-k8s-master-monitor
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: openshift-monitoring
+    ports:
+    - protocol: TCP
+      port: 9141
+  # TokenReview/SubjectAccessReview for scrape authentication. The API
+  # server endpoints are node IPs, not selectable by pod selectors.
+  egress:
+  - ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 6443
 ---
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
