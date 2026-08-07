@@ -2,98 +2,52 @@ package network
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
 	apifeatures "github.com/openshift/api/features"
+	mcfgv1alpha1 "github.com/openshift/api/machineconfiguration/v1alpha1"
 	operv1 "github.com/openshift/api/operator/v1"
 	"github.com/openshift/cluster-network-operator/pkg/bootstrap"
 	cnoclient "github.com/openshift/cluster-network-operator/pkg/client"
-	"github.com/openshift/cluster-network-operator/pkg/names"
 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/klog/v2"
 )
-
-// bgpVIPPeer is one BGP peer from the bgp-vip-config ConfigMap. String-typed
-// BFDEnabled and EBGPMultiHop match the installer's BGPPeerConfig
-// serialization.
-type bgpVIPPeer struct {
-	PeerAddress   string `json:"peerAddress"`
-	PeerASN       int64  `json:"peerASN"`
-	Password      string `json:"password,omitempty"`
-	BFDEnabled    string `json:"bfdEnabled,omitempty"`
-	EBGPMultiHop  string `json:"ebgpMultiHop,omitempty"`
-	HoldTime      string `json:"holdTime,omitempty"`
-	KeepaliveTime string `json:"keepaliveTime,omitempty"`
-}
-
-// bgpVIPConfigData is the parsed config.json of the bgp-vip-config
-// ConfigMap; the schema matches baremetal-runtimecfg's FRRPeerMapping.
-type bgpVIPConfigData struct {
-	LocalASN      int64                   `json:"localASN"`
-	DefaultPeers  []bgpVIPPeer            `json:"defaultPeers"`
-	Communities   []string                `json:"communities,omitempty"`
-	APIVIPs       []string                `json:"apiVIPs"`
-	IngressVIPs   []string                `json:"ingressVIPs"`
-	HostOverrides map[string][]bgpVIPPeer `json:"hostOverrides,omitempty"`
-}
 
 // apiCallTimeout bounds direct API calls made while rendering.
 const apiCallTimeout = 30 * time.Second
 
-// communityRe matches standard (AA:NN) and large (AA:BB:CC) BGP community
-// values; anything else is rejected before being spliced into rawConfig.
-var communityRe = regexp.MustCompile(`^\d+:\d+(:\d+)?$`)
+// BGPVIPConfigGVR locates the BGPVIPConfig singleton read via the dynamic
+// client; CNO has no typed clientset for machineconfiguration.openshift.io.
+// Shared with the operconfig controller informer wiring.
+var BGPVIPConfigGVR = schema.GroupVersionResource{
+	Group:    "machineconfiguration.openshift.io",
+	Version:  "v1alpha1",
+	Resource: "bgpvipconfigs",
+}
 
-// validateBGPVIPConfig rejects non-IP values before they are spliced into
-// the FRRConfiguration rawConfig.
-func validateBGPVIPConfig(cfg bgpVIPConfigData) error {
-	if cfg.LocalASN < 1 || cfg.LocalASN > 4294967295 {
-		return fmt.Errorf("localASN %d out of range", cfg.LocalASN)
+// validateBGPVIPInfraVIPs is the cross-object check the BGPVIPConfig CRD
+// cannot express: the VIPs come from the Infrastructure CR and are spliced
+// into the FRRConfiguration rawConfig, so they must be valid IPs. Spec-shape
+// validation (ASN ranges, peer addresses, community format, enums,
+// durations) is owned by the CRD's admission-time validation.
+func validateBGPVIPInfraVIPs(apiVIPs, ingressVIPs []string) error {
+	if len(apiVIPs)+len(ingressVIPs) == 0 {
+		return fmt.Errorf("BGP-based VIP management requires API or Ingress VIPs on the Infrastructure CR")
 	}
-	for _, vip := range slices.Concat(cfg.APIVIPs, cfg.IngressVIPs) {
+	for _, vip := range slices.Concat(apiVIPs, ingressVIPs) {
 		if net.ParseIP(vip) == nil {
 			return fmt.Errorf("VIP %q is not a valid IP address", vip)
-		}
-	}
-	for _, community := range cfg.Communities {
-		if !communityRe.MatchString(community) {
-			return fmt.Errorf("invalid BGP community %q", community)
-		}
-	}
-	peers := slices.Clone(cfg.DefaultPeers)
-	for _, hostPeers := range cfg.HostOverrides {
-		peers = append(peers, hostPeers...)
-	}
-	for _, peer := range peers {
-		if net.ParseIP(peer.PeerAddress) == nil {
-			return fmt.Errorf("BGP peer address %q is not a valid IP address", peer.PeerAddress)
-		}
-		if peer.PeerASN < 1 || peer.PeerASN > 4294967295 {
-			return fmt.Errorf("BGP peer %s: peerASN %d out of range", peer.PeerAddress, peer.PeerASN)
-		}
-		for _, d := range []string{peer.HoldTime, peer.KeepaliveTime} {
-			if d == "" {
-				continue
-			}
-			if _, err := time.ParseDuration(d); err != nil {
-				return fmt.Errorf("BGP peer %s: invalid duration %q", peer.PeerAddress, d)
-			}
-		}
-		for _, v := range []string{peer.BFDEnabled, peer.EBGPMultiHop} {
-			if v != "" && v != "true" && v != "false" {
-				return fmt.Errorf("BGP peer %s: invalid boolean %q", peer.PeerAddress, v)
-			}
 		}
 	}
 	return nil
@@ -118,12 +72,15 @@ func isBGPVIPManagement(bootstrapResult *bootstrap.BootstrapResult, featureGates
 }
 
 // renderBGPVIPFRRConfiguration builds FRRConfiguration CRs for BGP-managed
-// VIPs; a no-op unless BGP VIP management is active.
-func renderBGPVIPFRRConfiguration(conf *operv1.NetworkSpec, client cnoclient.Client, isBGP bool) ([]*uns.Unstructured, error) {
+// VIPs from the BGPVIPConfig CR; a no-op unless BGP VIP management is
+// active. It reports the outcome on the CR's SessionsConfigured condition.
+func renderBGPVIPFRRConfiguration(conf *operv1.NetworkSpec, client cnoclient.Client, bootstrapResult *bootstrap.BootstrapResult, isBGP bool) ([]*uns.Unstructured, error) {
 	if !isBGP {
 		return nil, nil
 	}
-	// The FRRConfiguration CRD ships with the frr-k8s bundle.
+	// The FRRConfiguration CRD ships with the frr-k8s bundle. Checked
+	// before the CR read: without the provider there is nothing to render
+	// into (and no condition is written since the CR was not consulted).
 	if conf == nil || conf.AdditionalRoutingCapabilities == nil ||
 		!slices.Contains(conf.AdditionalRoutingCapabilities.Providers, operv1.RoutingCapabilitiesProviderFRR) {
 		return nil, fmt.Errorf("BGP-based VIP management requires the FRR additional routing capability provider")
@@ -131,40 +88,108 @@ func renderBGPVIPFRRConfiguration(conf *operv1.NetworkSpec, client cnoclient.Cli
 
 	klog.Infof("BGP VIP management is active, rendering FRRConfiguration CRs")
 
-	cm := &corev1.ConfigMap{}
 	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
 	defer cancel()
-	err := client.Default().CRClient().Get(ctx,
-		types.NamespacedName{Name: "bgp-vip-config", Namespace: names.APPLIED_NAMESPACE}, cm)
+	obj, err := client.Default().Dynamic().Resource(BGPVIPConfigGVR).Get(ctx, "cluster", metav1.GetOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			klog.Infof("bgp-vip-config ConfigMap not found yet, skipping FRRConfiguration rendering")
+			klog.Infof("BGPVIPConfig \"cluster\" not found yet, skipping FRRConfiguration rendering")
 			return nil, nil
 		}
-		return nil, fmt.Errorf("failed to read bgp-vip-config ConfigMap: %v", err)
+		return nil, fmt.Errorf("failed to read BGPVIPConfig: %v", err)
+	}
+	bgpConfig := &mcfgv1alpha1.BGPVIPConfig{}
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(obj.Object, bgpConfig); err != nil {
+		return nil, setBGPVIPSessionsCondition(client, bgpConfig,
+			fmt.Errorf("failed to convert BGPVIPConfig: %v", err))
 	}
 
-	configJSON := cm.Data["config.json"]
-	if configJSON == "" {
-		return nil, fmt.Errorf("bgp-vip-config ConfigMap has no config.json data")
+	apiVIPs, ingressVIPs := bgpVIPInfraVIPs(bootstrapResult)
+	if err := validateBGPVIPInfraVIPs(apiVIPs, ingressVIPs); err != nil {
+		return nil, setBGPVIPSessionsCondition(client, bgpConfig, err)
 	}
 
-	var bgpConfig bgpVIPConfigData
-	if err := json.Unmarshal([]byte(configJSON), &bgpConfig); err != nil {
-		return nil, fmt.Errorf("failed to parse bgp-vip-config: %v", err)
-	}
-	if err := validateBGPVIPConfig(bgpConfig); err != nil {
-		return nil, fmt.Errorf("invalid bgp-vip-config: %v", err)
-	}
-	if len(bgpConfig.HostOverrides) > 0 {
+	if len(bgpConfig.Spec.HostOverrides) > 0 {
 		// Overrides reach control plane nodes through the MCO-rendered
 		// per-node peers file (runtimecfg keys them by short hostname);
 		// the cluster-wide CR intentionally carries only defaultPeers.
 		// See docs/bgp_vip_management.md.
-		klog.Warningf("bgp-vip-config hostOverrides apply to the static pod peers file only; the cluster-wide FRRConfiguration uses defaultPeers")
+		klog.Warningf("BGPVIPConfig hostOverrides apply to the static pod peers file only; the cluster-wide FRRConfiguration uses defaultPeers")
 	}
 
-	return buildFRRConfigurationObjects(bgpConfig)
+	objs, err := buildFRRConfigurationObjects(bgpConfig.Spec, apiVIPs, ingressVIPs)
+	if condErr := setBGPVIPSessionsCondition(client, bgpConfig, err); condErr != nil {
+		return nil, condErr
+	}
+	return objs, nil
+}
+
+// bgpVIPInfraVIPs extracts the API and Ingress VIPs from the BareMetal
+// Infrastructure status; isBGPVIPManagement guarantees it is present.
+func bgpVIPInfraVIPs(bootstrapResult *bootstrap.BootstrapResult) ([]string, []string) {
+	bm := bootstrapResult.Infra.PlatformStatus.BareMetal
+	var apiVIPs, ingressVIPs []string
+	for _, ip := range bm.APIServerInternalIPs {
+		apiVIPs = append(apiVIPs, string(ip))
+	}
+	for _, ip := range bm.IngressIPs {
+		ingressVIPs = append(ingressVIPs, string(ip))
+	}
+	return apiVIPs, ingressVIPs
+}
+
+// setBGPVIPSessionsCondition reports the render outcome on the BGPVIPConfig
+// SessionsConfigured condition via server-side apply on the status
+// subresource, owning only that condition type. It returns renderErr (or
+// wraps it with the condition-write failure) so callers can pass their
+// render error straight through.
+func setBGPVIPSessionsCondition(client cnoclient.Client, bgpConfig *mcfgv1alpha1.BGPVIPConfig, renderErr error) error {
+	condition := metav1.Condition{
+		Type:               mcfgv1alpha1.BGPVIPConfigSessionsConfigured,
+		Status:             metav1.ConditionTrue,
+		Reason:             "AsExpected",
+		Message:            "FRR session configuration rendered",
+		ObservedGeneration: bgpConfig.Generation,
+		LastTransitionTime: metav1.Now(),
+	}
+	if renderErr != nil {
+		condition.Status = metav1.ConditionFalse
+		condition.Reason = "RenderFailed"
+		condition.Message = renderErr.Error()
+	}
+	// Preserve lastTransitionTime when the status did not change so SSA
+	// resubmission does not churn the condition.
+	if existing := meta.FindStatusCondition(bgpConfig.Status.Conditions, condition.Type); existing != nil &&
+		existing.Status == condition.Status {
+		condition.LastTransitionTime = existing.LastTransitionTime
+	}
+
+	patch := &uns.Unstructured{Object: map[string]interface{}{
+		"apiVersion": mcfgv1alpha1.GroupVersion.String(),
+		"kind":       "BGPVIPConfig",
+		"metadata":   map[string]interface{}{"name": "cluster"},
+		"status": map[string]interface{}{
+			"conditions": []interface{}{map[string]interface{}{
+				"type":               condition.Type,
+				"status":             string(condition.Status),
+				"reason":             condition.Reason,
+				"message":            condition.Message,
+				"observedGeneration": condition.ObservedGeneration,
+				"lastTransitionTime": condition.LastTransitionTime.UTC().Format(time.RFC3339),
+			}},
+		},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
+	defer cancel()
+	_, err := client.Default().Dynamic().Resource(BGPVIPConfigGVR).ApplyStatus(ctx, "cluster", patch,
+		metav1.ApplyOptions{FieldManager: "cluster-network-operator", Force: true})
+	if err != nil {
+		if renderErr != nil {
+			return fmt.Errorf("%v (additionally, failed to update BGPVIPConfig status: %v)", renderErr, err)
+		}
+		return fmt.Errorf("failed to update BGPVIPConfig status: %v", err)
+	}
+	return renderErr
 }
 
 // buildFRRConfigurationObjects renders the cluster-wide (no node selector)
@@ -174,9 +199,9 @@ func renderBGPVIPFRRConfiguration(conf *operv1.NetworkSpec, client cnoclient.Cli
 // toAdvertise only permits declared prefixes (metallb/frr-k8s#469).
 // Per-node correctness comes from the health gate: kube-vip installs a
 // table-198 route only where the VIP's backend is healthy.
-func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, error) {
+func buildFRRConfigurationObjects(spec mcfgv1alpha1.BGPVIPConfigSpec, apiVIPs, ingressVIPs []string) ([]*uns.Unstructured, error) {
 	neighbors := []interface{}{}
-	for _, peer := range cfg.DefaultPeers {
+	for _, peer := range spec.DefaultPeers {
 		neighbor := map[string]interface{}{
 			"address": peer.PeerAddress,
 			"asn":     peer.PeerASN,
@@ -184,24 +209,29 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 		if peer.Password != "" {
 			neighbor["password"] = peer.Password
 		}
-		if peer.BFDEnabled == "true" {
+		if peer.Port != 0 {
+			neighbor["port"] = int64(peer.Port)
+		}
+		if peer.BFD == mcfgv1alpha1.BFDModeEnabled {
 			neighbor["bfdProfile"] = "vip-bfd"
 		}
-		if peer.EBGPMultiHop == "true" {
+		if peer.EBGPMultiHop == mcfgv1alpha1.EBGPMultiHopModeEnabled {
 			neighbor["ebgpMultiHop"] = true
 		}
-		if peer.HoldTime != "" {
-			neighbor["holdTime"] = peer.HoldTime
+		// Seconds render as the "<n>s" duration strings the ConfigMap
+		// carried, keeping the FRRConfiguration byte-identical.
+		if peer.HoldTimeSeconds != 0 {
+			neighbor["holdTime"] = fmt.Sprintf("%ds", peer.HoldTimeSeconds)
 		}
-		if peer.KeepaliveTime != "" {
-			neighbor["keepaliveTime"] = peer.KeepaliveTime
+		if peer.KeepaliveTimeSeconds != 0 {
+			neighbor["keepaliveTime"] = fmt.Sprintf("%ds", peer.KeepaliveTimeSeconds)
 		}
 		neighbors = append(neighbors, neighbor)
 	}
 
 	bfdProfiles := []interface{}{}
-	for _, peer := range cfg.DefaultPeers {
-		if peer.BFDEnabled == "true" {
+	for _, peer := range spec.DefaultPeers {
+		if peer.BFD == mcfgv1alpha1.BFDModeEnabled {
 			bfdProfiles = append(bfdProfiles, map[string]interface{}{
 				"name":             "vip-bfd",
 				"receiveInterval":  int64(300),
@@ -211,18 +241,18 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 		}
 	}
 
-	spec := map[string]interface{}{
+	frrSpec := map[string]interface{}{
 		"bgp": map[string]interface{}{
 			"bfdProfiles": bfdProfiles,
 			"routers": []interface{}{
 				map[string]interface{}{
-					"asn":       cfg.LocalASN,
+					"asn":       spec.LocalASN,
 					"neighbors": neighbors,
 				},
 			},
 		},
 		"raw": map[string]interface{}{
-			"rawConfig": buildBGPVIPRawConfig(cfg),
+			"rawConfig": buildBGPVIPRawConfig(spec, apiVIPs, ingressVIPs),
 		},
 	}
 
@@ -237,7 +267,7 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 					"app.kubernetes.io/managed-by": "cluster-network-operator",
 				},
 			},
-			"spec": spec,
+			"spec": frrSpec,
 		},
 	}
 
@@ -247,9 +277,9 @@ func buildFRRConfigurationObjects(cfg bgpVIPConfigData) ([]*uns.Unstructured, er
 // buildBGPVIPRawConfig mirrors MCO's bootstrap frr.conf.tmpl: redistribute
 // kernel table 198 filtered to exactly the VIP prefixes, plus egress permits
 // for them. Per-family blocks render only when that family has VIPs.
-func buildBGPVIPRawConfig(cfg bgpVIPConfigData) string {
+func buildBGPVIPRawConfig(spec mcfgv1alpha1.BGPVIPConfigSpec, apiVIPs, ingressVIPs []string) string {
 	var v4Prefixes, v6Prefixes []string
-	for _, vip := range slices.Concat(cfg.APIVIPs, cfg.IngressVIPs) {
+	for _, vip := range slices.Concat(apiVIPs, ingressVIPs) {
 		if strings.Contains(vip, ":") {
 			v6Prefixes = append(v6Prefixes, vip+"/128")
 		} else {
@@ -259,7 +289,7 @@ func buildBGPVIPRawConfig(cfg bgpVIPConfigData) string {
 
 	var b strings.Builder
 	// table-direct reads the kernel table directly; no `ip import-table`.
-	fmt.Fprintf(&b, "router bgp %d\n", cfg.LocalASN)
+	fmt.Fprintf(&b, "router bgp %d\n", spec.LocalASN)
 	if len(v4Prefixes) > 0 {
 		b.WriteString(" address-family ipv4 unicast\n")
 		b.WriteString("  redistribute table-direct 198 route-map BGP-VIP-ROUTES-V4\n")
@@ -276,7 +306,7 @@ func buildBGPVIPRawConfig(cfg bgpVIPConfigData) string {
 	if len(v4Prefixes) > 0 {
 		b.WriteString("route-map BGP-VIP-ROUTES-V4 permit 10\n")
 		b.WriteString(" match ip address prefix-list BGP-VIP-PREFIXES-V4\n")
-		for _, community := range cfg.Communities {
+		for _, community := range spec.Communities {
 			fmt.Fprintf(&b, " set community %s additive\n", community)
 		}
 		b.WriteString("route-map BGP-VIP-ROUTES-V4 deny 20\n")
@@ -284,7 +314,7 @@ func buildBGPVIPRawConfig(cfg bgpVIPConfigData) string {
 	if len(v6Prefixes) > 0 {
 		b.WriteString("route-map BGP-VIP-ROUTES-V6 permit 10\n")
 		b.WriteString(" match ipv6 address prefix-list BGP-VIP-PREFIXES-V6\n")
-		for _, community := range cfg.Communities {
+		for _, community := range spec.Communities {
 			fmt.Fprintf(&b, " set community %s additive\n", community)
 		}
 		b.WriteString("route-map BGP-VIP-ROUTES-V6 deny 20\n")
@@ -300,7 +330,7 @@ func buildBGPVIPRawConfig(cfg bgpVIPConfigData) string {
 	// falls through, so these high-sequence permits open egress for exactly
 	// the VIP prefixes. Couples to frr-k8s's route-map naming; native CRD
 	// support is proposed in metallb/frr-k8s#469.
-	for _, peer := range cfg.DefaultPeers {
+	for _, peer := range spec.DefaultPeers {
 		if len(v4Prefixes) > 0 {
 			fmt.Fprintf(&b, "route-map %s-out permit 4000\n", peer.PeerAddress)
 			b.WriteString(" match ip address prefix-list BGP-VIP-PREFIXES-V4\n")
