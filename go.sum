@@ -184,6 +184,8 @@ github.com/mitchellh/copystructure v1.2.0/go.mod h1:qLl+cE2AmVv+CoeAwDPye/v+N2HK
 github.com/mitchellh/reflectwalk v1.0.0/go.mod h1:mSTlrgnPZtwu0c4WaC2kGObEpuNDbx0jmZXqmk4esnw=
 github.com/mitchellh/reflectwalk v1.0.2 h1:G2LzWKi524PWgd3mLHV8Y5k7s6XUvT0Gef6zxSIeXaQ=
 github.com/mitchellh/reflectwalk v1.0.2/go.mod h1:mSTlrgnPZtwu0c4WaC2kGObEpuNDbx0jmZXqmk4esnw=
+github.com/mkowalski/openshift-api v0.0.0-20260807131454-15e15a151453 h1:wAU8FTRWKE2pBnxsrHnGbjIKIvaOu5j+F7EWdxAq/as=
+github.com/mkowalski/openshift-api v0.0.0-20260807131454-15e15a151453/go.mod h1:k6qH5QOVa5GDln2VVm8Jz4NV3Z7R2SATHFLwGS6Wh3M=
 github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
 github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd h1:TRLaZ9cD/w8PVh93nsPXa1VrQ6jlwL5oN8l14QlcNfg=
 github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=
@@ -200,8 +202,6 @@ github.com/onsi/ginkgo/v2 v2.28.2 h1:DTrMfpqxiNUyQ3Y0zhn1n3cOO2euFgQPYIpkWwxVFps
 github.com/onsi/ginkgo/v2 v2.28.2/go.mod h1:CLtbVInNckU3/+gC8LzkGUb9oF+e8W8TdUsxPwvdOgE=
 github.com/onsi/gomega v1.40.0 h1:Vtol0e1MghCD2ZVIilPDIg44XSL9l2QAn8ZNaljWcJc=
 github.com/onsi/gomega v1.40.0/go.mod h1:M/Uqpu/8qTjtzCLUA2zJHX9Iilrau25x1PdoSRbWh5A=
-github.com/openshift/api v0.0.0-20260724065811-356624ff036f h1:jGACG1DZvxDvRvH76Eh6SsXO1pVNsOqzMmvau1Oc4bc=
-github.com/openshift/api v0.0.0-20260724065811-356624ff036f/go.mod h1:k6qH5QOVa5GDln2VVm8Jz4NV3Z7R2SATHFLwGS6Wh3M=
 github.com/openshift/build-machinery-go v0.0.0-20260427155009-b879704ce51f h1:1BFlEUEcsxW1gNx64MxQQwgJDuuJxg5i7zUeOkla3QU=
 github.com/openshift/build-machinery-go v0.0.0-20260427155009-b879704ce51f/go.mod h1:8jcm8UPtg2mCAsxfqKil1xrmRMI3a+XU2TZ9fF8A7TE=
 github.com/openshift/client-go v0.0.0-20260715172546-dac61734e0ec h1:UDjX+mot5IVLpcChyBqLXG1oSB29s4UkqFmgNb0Xsqc=
