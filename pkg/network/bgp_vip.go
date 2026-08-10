@@ -15,6 +15,7 @@ import (
 	"github.com/openshift/cluster-network-operator/pkg/bootstrap"
 	cnoclient "github.com/openshift/cluster-network-operator/pkg/client"
 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -117,7 +118,12 @@ func renderBGPVIPFRRConfiguration(conf *operv1.NetworkSpec, client cnoclient.Cli
 		klog.Warningf("BGPVIPConfig hostOverrides apply to the static pod peers file only; the cluster-wide FRRConfiguration uses defaultPeers")
 	}
 
-	objs, err := buildFRRConfigurationObjects(bgpConfig.Spec, apiVIPs, ingressVIPs)
+	objs, err := buildFRRConfigurationObjects(bgpConfig.Spec, apiVIPs, ingressVIPs,
+		func(name string) (*corev1.Secret, error) {
+			ctx, cancel := context.WithTimeout(context.Background(), apiCallTimeout)
+			defer cancel()
+			return client.Default().Kubernetes().CoreV1().Secrets(bgpVIPSourceSecretNamespace).Get(ctx, name, metav1.GetOptions{})
+		})
 	if condErr := setBGPVIPSessionsCondition(client, bgpConfig, err); condErr != nil {
 		return nil, condErr
 	}
@@ -192,6 +198,20 @@ func setBGPVIPSessionsCondition(client cnoclient.Client, bgpConfig *mcfgv1alpha1
 	return renderErr
 }
 
+// BGP VIP session password Secrets are referenced by name from
+// openshift-config (the BGPVIPConfig API contract) but frr-k8s can only
+// resolve passwordSecret references from its own namespace, so CNO copies
+// them into openshift-frr-k8s.
+const (
+	bgpVIPSourceSecretNamespace = "openshift-config"
+	bgpVIPTargetSecretNamespace = "openshift-frr-k8s"
+)
+
+// bgpVIPSecretGetter resolves a BGPVIPPeer passwordSecret name to the
+// source Secret in openshift-config. Injected so tests stay client-free,
+// like the pre-fetched CR spec.
+type bgpVIPSecretGetter func(name string) (*corev1.Secret, error)
+
 // buildFRRConfigurationObjects renders the cluster-wide (no node selector)
 // FRRConfiguration. The CR spec carries only the BGP sessions; advertisement
 // is in rawConfig because the CRD cannot express health-gated redistribution:
@@ -199,15 +219,30 @@ func setBGPVIPSessionsCondition(client cnoclient.Client, bgpConfig *mcfgv1alpha1
 // toAdvertise only permits declared prefixes (metallb/frr-k8s#469).
 // Per-node correctness comes from the health gate: kube-vip installs a
 // table-198 route only where the VIP's backend is healthy.
-func buildFRRConfigurationObjects(spec mcfgv1alpha1.BGPVIPConfigSpec, apiVIPs, ingressVIPs []string) ([]*uns.Unstructured, error) {
+func buildFRRConfigurationObjects(spec mcfgv1alpha1.BGPVIPConfigSpec, apiVIPs, ingressVIPs []string, getSecret bgpVIPSecretGetter) ([]*uns.Unstructured, error) {
 	neighbors := []interface{}{}
+	secretObjs := []*uns.Unstructured{}
+	copiedSecrets := map[string]bool{}
 	for _, peer := range spec.DefaultPeers {
 		neighbor := map[string]interface{}{
 			"address": peer.PeerAddress,
 			"asn":     peer.PeerASN,
 		}
-		if peer.Password != "" {
-			neighbor["password"] = peer.Password
+		if name := peer.PasswordSecret.Name; name != "" {
+			// frr-k8s resolves the reference from its own namespace, so
+			// point it at the copy rendered below.
+			neighbor["passwordSecret"] = map[string]interface{}{
+				"name":      name,
+				"namespace": bgpVIPTargetSecretNamespace,
+			}
+			if !copiedSecrets[name] {
+				secretObj, err := buildBGPVIPSecretCopy(name, getSecret)
+				if err != nil {
+					return nil, err
+				}
+				secretObjs = append(secretObjs, secretObj)
+				copiedSecrets[name] = true
+			}
 		}
 		if peer.Port != 0 {
 			neighbor["port"] = int64(peer.Port)
@@ -271,7 +306,38 @@ func buildFRRConfigurationObjects(spec mcfgv1alpha1.BGPVIPConfigSpec, apiVIPs, i
 		},
 	}
 
-	return []*uns.Unstructured{obj}, nil
+	return append([]*uns.Unstructured{obj}, secretObjs...), nil
+}
+
+// buildBGPVIPSecretCopy reads the referenced kubernetes.io/basic-auth
+// Secret from openshift-config and renders an identical copy for
+// openshift-frr-k8s, emitted through the same generic apply pipeline as
+// the FRRConfiguration so ownership and pruning stay uniform.
+func buildBGPVIPSecretCopy(name string, getSecret bgpVIPSecretGetter) (*uns.Unstructured, error) {
+	source, err := getSecret(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read BGP VIP password Secret %s/%s: %v", bgpVIPSourceSecretNamespace, name, err)
+	}
+	if source.Type != corev1.SecretTypeBasicAuth {
+		return nil, fmt.Errorf("BGP VIP password Secret %s/%s has type %q, expected %q", bgpVIPSourceSecretNamespace, name, source.Type, corev1.SecretTypeBasicAuth)
+	}
+	copied := &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: bgpVIPTargetSecretNamespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "cluster-network-operator",
+			},
+		},
+		Type: source.Type,
+		Data: source.Data,
+	}
+	out, err := runtime.DefaultUnstructuredConverter.ToUnstructured(copied)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert BGP VIP password Secret %s: %v", name, err)
+	}
+	return &uns.Unstructured{Object: out}, nil
 }
 
 // buildBGPVIPRawConfig mirrors MCO's bootstrap frr.conf.tmpl: redistribute

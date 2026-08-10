@@ -1,11 +1,15 @@
 package network
 
 import (
+	"encoding/base64"
 	"reflect"
 	"testing"
 
 	. "github.com/onsi/gomega"
 	mcfgv1alpha1 "github.com/openshift/api/machineconfiguration/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	uns "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -22,7 +26,6 @@ func TestBuildFRRConfigurationObjectsTypedParity(t *testing.T) {
 		DefaultPeers: []mcfgv1alpha1.BGPVIPPeer{{
 			PeerAddress:          "192.168.111.1",
 			PeerASN:              64513,
-			Password:             "s3cret",
 			BFD:                  mcfgv1alpha1.BFDModeEnabled,
 			EBGPMultiHop:         mcfgv1alpha1.EBGPMultiHopModeEnabled,
 			HoldTimeSeconds:      90,
@@ -35,7 +38,7 @@ func TestBuildFRRConfigurationObjectsTypedParity(t *testing.T) {
 		}},
 	}
 
-	objs, err := buildFRRConfigurationObjects(spec, []string{"192.168.111.5"}, []string{"192.168.111.4"})
+	objs, err := buildFRRConfigurationObjects(spec, []string{"192.168.111.5"}, []string{"192.168.111.4"}, nil)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(objs).To(HaveLen(1))
 
@@ -67,7 +70,6 @@ func TestBuildFRRConfigurationObjectsTypedParity(t *testing.T) {
 							map[string]interface{}{
 								"address":       "192.168.111.1",
 								"asn":           int64(64513),
-								"password":      "s3cret",
 								"bfdProfile":    "vip-bfd",
 								"ebgpMultiHop":  true,
 								"holdTime":      "90s",
@@ -105,7 +107,7 @@ func TestBuildFRRConfigurationObjects(t *testing.T) {
 		DefaultPeers: []mcfgv1alpha1.BGPVIPPeer{{PeerAddress: "192.168.111.1", PeerASN: 64513}},
 	}
 
-	objs, err := buildFRRConfigurationObjects(spec, []string{"192.168.111.5"}, []string{"192.168.111.4"})
+	objs, err := buildFRRConfigurationObjects(spec, []string{"192.168.111.5"}, []string{"192.168.111.4"}, nil)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(objs).To(HaveLen(1))
 	g.Expect(objs[0].GetName()).To(Equal("bgp-vip"))
@@ -163,7 +165,6 @@ func TestBuildFRRConfigurationObjectsAllOptionalFields(t *testing.T) {
 		DefaultPeers: []mcfgv1alpha1.BGPVIPPeer{{
 			PeerAddress:          "192.168.111.1",
 			PeerASN:              64513,
-			Password:             "s3cret",
 			BFD:                  mcfgv1alpha1.BFDModeEnabled,
 			EBGPMultiHop:         mcfgv1alpha1.EBGPMultiHopModeEnabled,
 			HoldTimeSeconds:      90,
@@ -176,7 +177,7 @@ func TestBuildFRRConfigurationObjectsAllOptionalFields(t *testing.T) {
 		}},
 	}
 
-	objs, err := buildFRRConfigurationObjects(spec, []string{"192.168.111.5"}, []string{"192.168.111.4"})
+	objs, err := buildFRRConfigurationObjects(spec, []string{"192.168.111.5"}, []string{"192.168.111.4"}, nil)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(objs).To(HaveLen(1))
 
@@ -194,7 +195,6 @@ func TestBuildFRRConfigurationObjectsAllOptionalFields(t *testing.T) {
 	g.Expect(neighbor["ebgpMultiHop"]).To(Equal(true))
 	g.Expect(neighbor["holdTime"]).To(Equal("90s"))
 	g.Expect(neighbor["keepaliveTime"]).To(Equal("30s"))
-	g.Expect(neighbor["password"]).To(Equal("s3cret"))
 	g.Expect(neighbor["bfdProfile"]).To(Equal("vip-bfd"))
 	_, found, err = uns.NestedMap(neighbor, "toAdvertise")
 	g.Expect(err).NotTo(HaveOccurred())
@@ -231,7 +231,7 @@ func TestBuildFRRConfigurationObjectsDualStack(t *testing.T) {
 	}
 
 	objs, err := buildFRRConfigurationObjects(spec,
-		[]string{"192.168.111.5", "fd2e:6f44:5dd8::5"}, []string{"192.168.111.4", "fd2e:6f44:5dd8::4"})
+		[]string{"192.168.111.5", "fd2e:6f44:5dd8::5"}, []string{"192.168.111.4", "fd2e:6f44:5dd8::4"}, nil)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(objs).To(HaveLen(1))
 
@@ -264,4 +264,81 @@ func TestValidateBGPVIPInfraVIPs(t *testing.T) {
 	g.Expect(validateBGPVIPInfraVIPs(nil, []string{"not-an-ip"})).NotTo(Succeed())
 	// No VIPs at all: BGP VIP management has nothing to advertise.
 	g.Expect(validateBGPVIPInfraVIPs(nil, nil)).NotTo(Succeed())
+}
+
+// TestBuildFRRConfigurationObjectsPasswordSecret locks the passwordSecret
+// mapping: the neighbor references the copy in openshift-frr-k8s (never an
+// inline password), and the object list carries the copied
+// kubernetes.io/basic-auth Secret rendered from openshift-config.
+func TestBuildFRRConfigurationObjectsPasswordSecret(t *testing.T) {
+	g := NewGomegaWithT(t)
+	spec := mcfgv1alpha1.BGPVIPConfigSpec{
+		LocalASN: 64512,
+		DefaultPeers: []mcfgv1alpha1.BGPVIPPeer{{
+			PeerAddress:    "192.168.111.1",
+			PeerASN:        64513,
+			PasswordSecret: mcfgv1alpha1.BGPVIPPasswordSecret{Name: "bgp-peer-password"},
+		}},
+	}
+	getSecret := func(name string) (*corev1.Secret, error) {
+		g.Expect(name).To(Equal("bgp-peer-password"))
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "openshift-config"},
+			Type:       corev1.SecretTypeBasicAuth,
+			Data:       map[string][]byte{"password": []byte("s3cret")},
+		}, nil
+	}
+
+	objs, err := buildFRRConfigurationObjects(spec, []string{"192.168.111.5"}, nil, getSecret)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(objs).To(HaveLen(2))
+
+	routers, _, err := uns.NestedSlice(objs[0].Object, "spec", "bgp", "routers")
+	g.Expect(err).NotTo(HaveOccurred())
+	neighbors, _, err := uns.NestedSlice(routers[0].(map[string]interface{}), "neighbors")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(neighbors).To(HaveLen(1))
+	neighbor := neighbors[0].(map[string]interface{})
+	// The reference points at the copy in the frr-k8s namespace; no
+	// inline password is ever rendered.
+	g.Expect(neighbor["passwordSecret"]).To(Equal(map[string]interface{}{
+		"name":      "bgp-peer-password",
+		"namespace": "openshift-frr-k8s",
+	}))
+	g.Expect(neighbor).NotTo(HaveKey("password"))
+
+	secretObj := objs[1]
+	g.Expect(secretObj.GetKind()).To(Equal("Secret"))
+	g.Expect(secretObj.GetAPIVersion()).To(Equal("v1"))
+	g.Expect(secretObj.GetName()).To(Equal("bgp-peer-password"))
+	g.Expect(secretObj.GetNamespace()).To(Equal("openshift-frr-k8s"))
+	secretType, _, err := uns.NestedString(secretObj.Object, "type")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(secretType).To(Equal(string(corev1.SecretTypeBasicAuth)))
+	data, _, err := uns.NestedStringMap(secretObj.Object, "data")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(data).To(Equal(map[string]string{"password": base64.StdEncoding.EncodeToString([]byte("s3cret"))}))
+}
+
+// TestBuildFRRConfigurationObjectsPasswordSecretMissing locks the error
+// path: a missing source Secret fails the render (Degraded +
+// SessionsConfigured=False) instead of configuring unauthenticated
+// sessions.
+func TestBuildFRRConfigurationObjectsPasswordSecretMissing(t *testing.T) {
+	g := NewGomegaWithT(t)
+	spec := mcfgv1alpha1.BGPVIPConfigSpec{
+		LocalASN: 64512,
+		DefaultPeers: []mcfgv1alpha1.BGPVIPPeer{{
+			PeerAddress:    "192.168.111.1",
+			PeerASN:        64513,
+			PasswordSecret: mcfgv1alpha1.BGPVIPPasswordSecret{Name: "no-such-secret"},
+		}},
+	}
+	getSecret := func(name string) (*corev1.Secret, error) {
+		return nil, apierrors.NewNotFound(corev1.Resource("secrets"), name)
+	}
+
+	_, err := buildFRRConfigurationObjects(spec, []string{"192.168.111.5"}, nil, getSecret)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("openshift-config/no-such-secret"))
 }
