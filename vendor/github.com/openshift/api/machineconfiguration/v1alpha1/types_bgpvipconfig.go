@@ -9,7 +9,7 @@ import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 // +kubebuilder:resource:path=bgpvipconfigs,scope=Cluster
 // +kubebuilder:subresource:status
 // +kubebuilder:validation:XValidation:rule="self.metadata.name == 'cluster'",message="bgpvipconfig is a singleton; metadata.name must be 'cluster'"
-// +openshift:api-approved.openshift.io=https://github.com/openshift/api/pull/XXXX
+// +openshift:api-approved.openshift.io=https://github.com/openshift/api/pull/2972
 // +openshift:file-pattern=cvoRunLevel=0000_80,operatorName=machine-config,operatorOrdering=01
 // +openshift:enable:FeatureGate=BGPBasedVIPManagement
 // +openshift:compatibility-gen:level=4
@@ -62,6 +62,7 @@ type BGPVIPConfigSpec struct {
 	// +kubebuilder:validation:MaxItems=8
 	// +kubebuilder:validation:items:MaxLength=32
 	// +kubebuilder:validation:items:Pattern=`^\d+:\d+(:\d+)?$`
+	// +kubebuilder:validation:items:XValidation:rule="self.split(':').all(s, s.size() <= 10 && int(s) <= 4294967295)",message="each colon-separated segment must be between 0 and 4294967295"
 	// +optional
 	Communities []string `json:"communities,omitempty"`
 
@@ -118,6 +119,18 @@ const (
 	EBGPMultiHopModeDisabled EBGPMultiHopMode = "Disabled"
 )
 
+// BGPVIPPasswordSecret references a Secret in the openshift-config
+// namespace by name.
+type BGPVIPPasswordSecret struct {
+	// name is the metadata.name of the referenced Secret in the
+	// openshift-config namespace. Must be an RFC 1123 subdomain.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:XValidation:rule="self.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$')",message="name must be an RFC 1123 subdomain"
+	// +required
+	Name string `json:"name"`
+}
+
 // BGPVIPPeer describes one BGP neighbor.
 // +kubebuilder:validation:XValidation:rule="!(has(self.holdTimeSeconds) && has(self.keepaliveTimeSeconds)) || self.holdTimeSeconds == 0 || self.keepaliveTimeSeconds == 0 || self.holdTimeSeconds >= 3 * self.keepaliveTimeSeconds",message="holdTimeSeconds must be at least 3 times keepaliveTimeSeconds"
 type BGPVIPPeer struct {
@@ -135,12 +148,15 @@ type BGPVIPPeer struct {
 	// +required
 	PeerASN int64 `json:"peerASN"`
 
-	// password is the TCP MD5 password (RFC 2385) for the session, in clear
-	// text; the kernel limits it to 80 bytes. When omitted, the session is
+	// passwordSecret references the Secret carrying the TCP MD5 password
+	// (RFC 2385) for the session. The Secret must be of type
+	// kubernetes.io/basic-auth, live in the openshift-config namespace, and
+	// carry the password in its "password" key (at most 80 bytes, the
+	// kernel's TCP MD5 limit). Passwords are never stored in this API; the
+	// consumers resolve the reference. When omitted, the session is
 	// unauthenticated.
-	// +kubebuilder:validation:MaxLength=80
 	// +optional
-	Password string `json:"password,omitempty"`
+	PasswordSecret BGPVIPPasswordSecret `json:"passwordSecret,omitempty,omitzero"`
 
 	// port is the TCP port of the BGP session. When omitted, port 179 is
 	// used; this default is applied by the consumers and is subject to
@@ -203,7 +219,7 @@ const (
 	BGPVIPConfigRendered = "Rendered"
 	// BGPVIPConfigSessionsConfigured is set by the cluster-network-operator
 	// when the FRR session configuration reflecting the current spec has
-	// been applied.
+	// been rendered for application.
 	BGPVIPConfigSessionsConfigured = "SessionsConfigured"
 )
 

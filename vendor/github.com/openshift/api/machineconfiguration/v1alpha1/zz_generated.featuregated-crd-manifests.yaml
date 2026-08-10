@@ -1,6 +1,6 @@
 bgpvipconfigs.machineconfiguration.openshift.io:
   Annotations: {}
-  ApprovedPRNumber: https://github.com/openshift/api/pull/XXXX
+  ApprovedPRNumber: https://github.com/openshift/api/pull/2972
   CRDName: bgpvipconfigs.machineconfiguration.openshift.io
   Capability: ""
   Category: ""

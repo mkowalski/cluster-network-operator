@@ -31,6 +31,11 @@ func (in BGPVIPHostPeers) OpenAPIModelName() string {
 }
 
 // OpenAPIModelName returns the OpenAPI model name for this type.
+func (in BGPVIPPasswordSecret) OpenAPIModelName() string {
+	return "com.github.openshift.api.machineconfiguration.v1alpha1.BGPVIPPasswordSecret"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
 func (in BGPVIPPeer) OpenAPIModelName() string {
 	return "com.github.openshift.api.machineconfiguration.v1alpha1.BGPVIPPeer"
 }

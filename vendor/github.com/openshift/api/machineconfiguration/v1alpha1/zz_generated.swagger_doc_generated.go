@@ -61,11 +61,20 @@ func (BGPVIPHostPeers) SwaggerDoc() map[string]string {
 	return map_BGPVIPHostPeers
 }
 
+var map_BGPVIPPasswordSecret = map[string]string{
+	"":     "BGPVIPPasswordSecret references a Secret in the openshift-config namespace by name.",
+	"name": "name is the metadata.name of the referenced Secret in the openshift-config namespace. Must be an RFC 1123 subdomain.",
+}
+
+func (BGPVIPPasswordSecret) SwaggerDoc() map[string]string {
+	return map_BGPVIPPasswordSecret
+}
+
 var map_BGPVIPPeer = map[string]string{
 	"":                     "BGPVIPPeer describes one BGP neighbor.",
 	"peerAddress":          "peerAddress is the IP address of the BGP neighbor (IPv4 or IPv6); the session's address family follows the address family of this value.",
 	"peerASN":              "peerASN is the autonomous system number of the neighbor. Must be between 1 and 4294967295.",
-	"password":             "password is the TCP MD5 password (RFC 2385) for the session, in clear text; the kernel limits it to 80 bytes. When omitted, the session is unauthenticated.",
+	"passwordSecret":       "passwordSecret references the Secret carrying the TCP MD5 password (RFC 2385) for the session. The Secret must be of type kubernetes.io/basic-auth, live in the openshift-config namespace, and carry the password in its \"password\" key (at most 80 bytes, the kernel's TCP MD5 limit). Passwords are never stored in this API; the consumers resolve the reference. When omitted, the session is unauthenticated.",
 	"port":                 "port is the TCP port of the BGP session. When omitted, port 179 is used; this default is applied by the consumers and is subject to change over time.",
 	"bfd":                  "bfd determines whether the session is backed by BFD fast failure detection. Allowed values are \"Enabled\", \"Disabled\" and omitted. When omitted, BFD is disabled; this default is subject to change over time.",
 	"ebgpMultiHop":         "ebgpMultiHop determines whether the session may cross multiple hops. Allowed values are \"Enabled\", \"Disabled\" and omitted. When omitted, multihop is disabled; this default is subject to change over time.",
