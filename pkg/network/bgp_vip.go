@@ -207,6 +207,18 @@ const (
 	bgpVIPTargetSecretNamespace = "openshift-frr-k8s"
 )
 
+// INTERIM for https://github.com/metallb/frr-k8s/issues/484: the frr-k8s
+// validation webhook blanks passwordSecret before merge validation, so a
+// secret-ref neighbor merged with another producer's inline-password
+// neighbor is rejected. MetalLB always inlines passwords, so mixed
+// representations wedge ALL FRRConfiguration writes for the shared
+// neighbor. Until a fixed frr-k8s ships, render the resolved password
+// inline (exactly like MetalLB does) instead of passwordSecret + a Secret
+// copy into openshift-frr-k8s. Revert plan: flip this const back to false
+// once frr-k8s#484 is fixed; the passwordSecret code path below is kept
+// intact and pre-tested against both settings.
+const renderInlinePassword = true
+
 // bgpVIPSecretGetter resolves a BGPVIPPeer passwordSecret name to the
 // source Secret in openshift-config. Injected so tests stay client-free,
 // like the pre-fetched CR spec.
@@ -220,6 +232,13 @@ type bgpVIPSecretGetter func(name string) (*corev1.Secret, error)
 // Per-node correctness comes from the health gate: kube-vip installs a
 // table-198 route only where the VIP's backend is healthy.
 func buildFRRConfigurationObjects(spec mcfgv1alpha1.BGPVIPConfigSpec, apiVIPs, ingressVIPs []string, getSecret bgpVIPSecretGetter) ([]*uns.Unstructured, error) {
+	return buildFRRConfigurationObjectsInline(spec, apiVIPs, ingressVIPs, getSecret, renderInlinePassword)
+}
+
+// buildFRRConfigurationObjectsInline exists so the frr-k8s#484 revert
+// (renderInlinePassword = false) stays tested; production always passes
+// the const.
+func buildFRRConfigurationObjectsInline(spec mcfgv1alpha1.BGPVIPConfigSpec, apiVIPs, ingressVIPs []string, getSecret bgpVIPSecretGetter, inlinePassword bool) ([]*uns.Unstructured, error) {
 	neighbors := []interface{}{}
 	secretObjs := []*uns.Unstructured{}
 	copiedSecrets := map[string]bool{}
@@ -229,19 +248,30 @@ func buildFRRConfigurationObjects(spec mcfgv1alpha1.BGPVIPConfigSpec, apiVIPs, i
 			"asn":     peer.PeerASN,
 		}
 		if name := peer.PasswordSecret.Name; name != "" {
-			// frr-k8s resolves the reference from its own namespace, so
-			// point it at the copy rendered below.
-			neighbor["passwordSecret"] = map[string]interface{}{
-				"name":      name,
-				"namespace": bgpVIPTargetSecretNamespace,
-			}
-			if !copiedSecrets[name] {
-				secretObj, err := buildBGPVIPSecretCopy(name, getSecret)
+			if inlinePassword {
+				// INTERIM for frr-k8s#484 (see renderInlinePassword):
+				// resolve the secret and inline the password like
+				// MetalLB, so merge validation sees one representation.
+				password, err := resolveBGPVIPPassword(name, getSecret)
 				if err != nil {
 					return nil, err
 				}
-				secretObjs = append(secretObjs, secretObj)
-				copiedSecrets[name] = true
+				neighbor["password"] = password
+			} else {
+				// frr-k8s resolves the reference from its own namespace, so
+				// point it at the copy rendered below.
+				neighbor["passwordSecret"] = map[string]interface{}{
+					"name":      name,
+					"namespace": bgpVIPTargetSecretNamespace,
+				}
+				if !copiedSecrets[name] {
+					secretObj, err := buildBGPVIPSecretCopy(name, getSecret)
+					if err != nil {
+						return nil, err
+					}
+					secretObjs = append(secretObjs, secretObj)
+					copiedSecrets[name] = true
+				}
 			}
 		}
 		if peer.Port != 0 {
@@ -309,17 +339,41 @@ func buildFRRConfigurationObjects(spec mcfgv1alpha1.BGPVIPConfigSpec, apiVIPs, i
 	return append([]*uns.Unstructured{obj}, secretObjs...), nil
 }
 
-// buildBGPVIPSecretCopy reads the referenced kubernetes.io/basic-auth
-// Secret from openshift-config and renders an identical copy for
-// openshift-frr-k8s, emitted through the same generic apply pipeline as
-// the FRRConfiguration so ownership and pruning stay uniform.
-func buildBGPVIPSecretCopy(name string, getSecret bgpVIPSecretGetter) (*uns.Unstructured, error) {
+// resolveBGPVIPPassword reads the referenced kubernetes.io/basic-auth
+// Secret from openshift-config and returns its password value for inline
+// rendering (INTERIM for frr-k8s#484, see renderInlinePassword).
+func resolveBGPVIPPassword(name string, getSecret bgpVIPSecretGetter) (string, error) {
+	source, err := getBGPVIPBasicAuthSecret(name, getSecret)
+	if err != nil {
+		return "", err
+	}
+	password, ok := source.Data[corev1.BasicAuthPasswordKey]
+	if !ok || len(password) == 0 {
+		return "", fmt.Errorf("BGP VIP password Secret %s/%s has no %q key", bgpVIPSourceSecretNamespace, name, corev1.BasicAuthPasswordKey)
+	}
+	return string(password), nil
+}
+
+// getBGPVIPBasicAuthSecret resolves and validates the source Secret.
+func getBGPVIPBasicAuthSecret(name string, getSecret bgpVIPSecretGetter) (*corev1.Secret, error) {
 	source, err := getSecret(name)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read BGP VIP password Secret %s/%s: %v", bgpVIPSourceSecretNamespace, name, err)
 	}
 	if source.Type != corev1.SecretTypeBasicAuth {
 		return nil, fmt.Errorf("BGP VIP password Secret %s/%s has type %q, expected %q", bgpVIPSourceSecretNamespace, name, source.Type, corev1.SecretTypeBasicAuth)
+	}
+	return source, nil
+}
+
+// buildBGPVIPSecretCopy reads the referenced kubernetes.io/basic-auth
+// Secret from openshift-config and renders an identical copy for
+// openshift-frr-k8s, emitted through the same generic apply pipeline as
+// the FRRConfiguration so ownership and pruning stay uniform.
+func buildBGPVIPSecretCopy(name string, getSecret bgpVIPSecretGetter) (*uns.Unstructured, error) {
+	source, err := getBGPVIPBasicAuthSecret(name, getSecret)
+	if err != nil {
+		return nil, err
 	}
 	copied := &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},

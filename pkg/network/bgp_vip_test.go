@@ -266,10 +266,10 @@ func TestValidateBGPVIPInfraVIPs(t *testing.T) {
 	g.Expect(validateBGPVIPInfraVIPs(nil, nil)).NotTo(Succeed())
 }
 
-// TestBuildFRRConfigurationObjectsPasswordSecret locks the passwordSecret
-// mapping: the neighbor references the copy in openshift-frr-k8s (never an
-// inline password), and the object list carries the copied
-// kubernetes.io/basic-auth Secret rendered from openshift-config.
+// TestBuildFRRConfigurationObjectsPasswordSecret locks the INTERIM inline
+// rendering for https://github.com/metallb/frr-k8s/issues/484: the neighbor
+// carries the resolved password inline (matching MetalLB), no passwordSecret
+// reference is rendered, and no copied Secret is emitted.
 func TestBuildFRRConfigurationObjectsPasswordSecret(t *testing.T) {
 	g := NewGomegaWithT(t)
 	spec := mcfgv1alpha1.BGPVIPConfigSpec{
@@ -290,6 +290,46 @@ func TestBuildFRRConfigurationObjectsPasswordSecret(t *testing.T) {
 	}
 
 	objs, err := buildFRRConfigurationObjects(spec, []string{"192.168.111.5"}, nil, getSecret)
+	g.Expect(err).NotTo(HaveOccurred())
+	// No copied Secret object while the frr-k8s#484 interim inlining is
+	// active: only the FRRConfiguration is rendered.
+	g.Expect(objs).To(HaveLen(1))
+
+	routers, _, err := uns.NestedSlice(objs[0].Object, "spec", "bgp", "routers")
+	g.Expect(err).NotTo(HaveOccurred())
+	neighbors, _, err := uns.NestedSlice(routers[0].(map[string]interface{}), "neighbors")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(neighbors).To(HaveLen(1))
+	neighbor := neighbors[0].(map[string]interface{})
+	g.Expect(neighbor["password"]).To(Equal("s3cret"))
+	g.Expect(neighbor).NotTo(HaveKey("passwordSecret"))
+}
+
+// TestBuildFRRConfigurationObjectsPasswordSecretRefForm pre-tests the
+// frr-k8s#484 revert (renderInlinePassword = false): the neighbor
+// references the copy in openshift-frr-k8s (no inline password), and the
+// object list carries the copied kubernetes.io/basic-auth Secret rendered
+// from openshift-config.
+func TestBuildFRRConfigurationObjectsPasswordSecretRefForm(t *testing.T) {
+	g := NewGomegaWithT(t)
+	spec := mcfgv1alpha1.BGPVIPConfigSpec{
+		LocalASN: 64512,
+		DefaultPeers: []mcfgv1alpha1.BGPVIPPeer{{
+			PeerAddress:    "192.168.111.1",
+			PeerASN:        64513,
+			PasswordSecret: mcfgv1alpha1.BGPVIPPasswordSecret{Name: "bgp-peer-password"},
+		}},
+	}
+	getSecret := func(name string) (*corev1.Secret, error) {
+		g.Expect(name).To(Equal("bgp-peer-password"))
+		return &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "openshift-config"},
+			Type:       corev1.SecretTypeBasicAuth,
+			Data:       map[string][]byte{"password": []byte("s3cret")},
+		}, nil
+	}
+
+	objs, err := buildFRRConfigurationObjectsInline(spec, []string{"192.168.111.5"}, nil, getSecret, false)
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(objs).To(HaveLen(2))
 
